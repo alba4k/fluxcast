@@ -93,7 +93,7 @@ def main() -> None:
 
     _tty_state = _save_term() # save before ffmpeg corrupts it
 
-    ffmpeg_proc = None
+    ffmpeg_procs = None
     stream_server = None
     tv = None
 
@@ -105,13 +105,13 @@ def main() -> None:
                     from dlna import stop_cast
                     stop_cast(tv)
                 else:
-                    from cast import stop_cast
-                    stop_cast(tv)
+                    from cast import cast
+                    cast.stop_cast(tv)
             except Exception:
                 pass
         if stream_server:
             stream_server.stop()
-        stop_capture(ffmpeg_proc)
+        stop_capture(ffmpeg_procs)
         _restore_term(_tty_state)
         print("[FluxCast] Stopped. Goodbye!")
         sys.exit(0)
@@ -125,7 +125,7 @@ def main() -> None:
 
     monitor = prompt_monitor()
 
-    ffmpeg_proc = start_capture(
+    ffmpeg_procs = start_capture(
         monitor=monitor,
         fps=args.fps,
         bitrate=args.bitrate,
@@ -135,12 +135,12 @@ def main() -> None:
 
     # HTTP server
     stream_server = StreamServer(host="0.0.0.0", port=args.port)
-    stream_server.start(ffmpeg_proc)
-    print(f"[FluxCast] HTTP server:  {stream_url}")
+    stream_server.start(ffmpeg_procs[0])
+    print(f"[FluxCast] HTTP server: {stream_url}")
 
     import glob
-    print("[FluxCast] Waiting for first video segment to be ready…", end="", flush=True)
-    waited = 0
+    print("[FluxCast] Waiting for first HLS segment…", end="", flush=True)
+    waited = 0.0
     while not glob.glob("/tmp/fluxcast/stream*.ts"):
         time.sleep(0.2)
         waited += 0.2

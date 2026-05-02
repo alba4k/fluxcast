@@ -5,20 +5,20 @@ import subprocess
 import shutil
 import sys
 import time
-from typing import Optional, NamedTuple
+from typing import Optional, NamedTuple, List
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/sbin/ffmpeg"
+VIDEO_FIFO = "/tmp/fluxcast_vid.pipe"
 
 
 class Monitor(NamedTuple):
     display: str
-    name: str # e.g. 'eDP-1'
+    name: str    # e.g. 'eDP-1'
     width: int
     height: int
-    x: int # x offset within the combined framebuffer
+    x: int       # x offset within the combined framebuffer
     y: int
-    refresh: float # Hz
-
+    refresh: float  # Hz
 
 
 def _detect_live_displays() -> list:
@@ -115,67 +115,131 @@ def prompt_monitor() -> Monitor:
         return monitors[default_idx]
 
 
+def _detect_audio_monitor() -> str:
+    """Return the .monitor PulseAudio source for the currently running sink."""
+    try:
+        out = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True)
+        for line in out.splitlines():
+            if "RUNNING" in line:
+                return line.split('\t')[1] + ".monitor"
+    except Exception:
+        pass
+    return "default"
+
+
 def start_capture(
     monitor: Monitor,
     fps: int = 30,
     bitrate: str = "4M",
     output_resolution: Optional[str] = None,
-) -> "subprocess.Popen[bytes]":
+) -> List["subprocess.Popen[bytes]"]:
+    """
+    Returns [wf_proc, ffmpeg_proc].  Both must be passed to stop_capture().
+    
+    Architecture:
+      wf-recorder (Wayland-native video) → NUT over named FIFO → ffmpeg (adds PulseAudio audio) → HLS
+    """
     src_res = f"{monitor.width}x{monitor.height}"
     out_res = output_resolution or src_res
-    cmd = [
-        "wf-recorder",
-        "-y",
-        "-D",
-        "-r", str(fps),
-        "-a", # capture system audio
-        "-C", "aac",
-        "-P", "b:a=128k",
-        "-c", "libx264",
-        "-m", "hls",
-        "-p", "preset=ultrafast",
-        "-p", "tune=zerolatency",
-        "-p", "hls_time=2",
-        "-p", "hls_list_size=6",
-        "-p", "hls_flags=append_list",
-        "-p", "pix_fmt=yuv420p",
-        "-p", "profile=main",
-        "-f", "/tmp/fluxcast/stream.m3u8",
-        "-o", monitor.name,
-    ]
 
-    print(f"[FluxCast] Capturing Wayland monitor : {monitor.name} ({src_res})")
-    if out_res != src_res:
-        print(f"[FluxCast] Scaling output to : {out_res}")
+    audio_monitor = _detect_audio_monitor()
 
+    # Prepare HLS output dir
     hls_dir = "/tmp/fluxcast"
     if os.path.exists(hls_dir):
         shutil.rmtree(hls_dir)
     os.makedirs(hls_dir, exist_ok=True)
 
+    # Named FIFO for video: wf-recorder → ffmpeg
+    if os.path.exists(VIDEO_FIFO):
+        os.remove(VIDEO_FIFO)
+    os.mkfifo(VIDEO_FIFO)
+
+    vf_filters = []
+    if out_res != src_res:
+        vf_filters.append(f"scale={out_res.replace('x', ':')}")
+
+    # ── Process 1: wf-recorder (video only, NUT muxer, pipe-friendly) ─────────
+    wf_cmd = [
+        "wf-recorder",
+        "-y",
+        "-D",               # no-damage: constant FPS even on static screens
+        "-r", str(fps),
+        "-o", monitor.name, # Wayland output name (e.g. HDMI-A-1)
+        "-c", "libx264",    # encode in H.264 so the FIFO carries small data
+        "-m", "nut",        # NUT muxer — designed for pipes, no seekable index needed
+        "-p", "preset=ultrafast",
+        "-p", "tune=zerolatency",
+        "-p", "pix_fmt=yuv420p",
+        "-p", "profile=main",
+        "-f", VIDEO_FIFO,   # write to named FIFO
+    ]
+
+    # ── Process 2: ffmpeg (reads video from FIFO + audio from PulseAudio → HLS) ─
+    ffmpeg_cmd = [
+        FFMPEG_PATH, "-y",
+        "-loglevel", "warning",
+
+        # Video from wf-recorder via FIFO
+        "-f", "nut",
+        "-i", VIDEO_FIFO,
+
+        # Audio from PulseAudio (ffmpeg wakes up suspended sinks)
+        "-f", "pulse",
+        "-i", audio_monitor,
+    ]
+
+    if vf_filters:
+        ffmpeg_cmd += ["-vf", ",".join(vf_filters)]
+
+    ffmpeg_cmd += [
+        "-c:v", "copy",         # video already encoded by wf-recorder, just copy
+        "-c:a", "aac",
+        "-b:a", "128k",
+
+        # HLS output — Samsung Tizen proven format
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "6",
+        "-hls_flags", "append_list",
+        f"{hls_dir}/stream.m3u8",
+    ]
+
+    print(f"[FluxCast] Capturing screen : {monitor.name} via Wayland ({src_res})")
+    print(f"[FluxCast] Capturing audio  : {audio_monitor}")
+    if out_res != src_res:
+        print(f"[FluxCast] Scaling output to: {out_res}")
+
     try:
-        process = subprocess.Popen(
-            cmd,
-            stderr=subprocess.DEVNULL,
-        )
+        # Start ffmpeg FIRST (it opens the FIFO for reading, blocking until wf-recorder opens for writing)
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.DEVNULL)
+        # Then start wf-recorder (opens FIFO for writing, unblocking ffmpeg)
+        wf_proc = subprocess.Popen(wf_cmd, stderr=subprocess.DEVNULL)
     except FileNotFoundError as e:
         print(f"[FluxCast] ERROR: Required executable not found: {e}")
         sys.exit(1)
 
-    time.sleep(1.5)
-    if process.poll() is not None:
+    time.sleep(2.0)
+    if wf_proc.poll() is not None:
         print(f"[FluxCast] ERROR: wf-recorder exited immediately. Check monitor name.")
         sys.exit(1)
+    if ffmpeg_proc.poll() is not None:
+        print(f"[FluxCast] ERROR: ffmpeg exited immediately. Check audio device.")
+        sys.exit(1)
 
-    return process
+    return [wf_proc, ffmpeg_proc]
 
 
-def stop_capture(process: "Optional[subprocess.Popen[bytes]]") -> None:
-    if process is None:
+def stop_capture(processes: "Optional[List[subprocess.Popen[bytes]]]") -> None:
+    if not processes:
         return
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    for proc in processes:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    # Clean up FIFO
+    if os.path.exists(VIDEO_FIFO):
+        os.remove(VIDEO_FIFO)
