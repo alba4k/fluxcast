@@ -11,6 +11,10 @@ HLS_DIR = "/tmp/fluxcast"
 HLS_SEGMENT_SECONDS = 1.0
 LIVE_TS_SIZE = 1_000_000_000_000
 LIVE_TS_PREROLL_SEGMENTS = 1
+PROGRESSIVE_TS_SIZE = 10_000_000_000
+PROGRESSIVE_TS_PATH = os.path.join(HLS_DIR, "progressive.ts")
+PROGRESSIVE_TS_CHUNK_SIZE = 128 * 1024
+PROGRESSIVE_TS_SEEK_TOLERANCE = 8 * 1024 * 1024
 
 DLNA_FLAGS = "01700000000000000000000000000000"
 HLS_CONTENT_FEATURES = (
@@ -44,8 +48,166 @@ def _content_features(path: str) -> str:
     return HLS_CONTENT_FEATURES
 
 
+class ProgressiveTS:
+    """Builds one byte-addressable MPEG-TS stream from fresh HLS segments."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+        self._segments: set[str] = set()
+        self._size = 0
+        self._generation = 0
+        self._active_readers = 0
+
+    def reset(self) -> None:
+        with self._cond:
+            self._generation += 1
+            self._started = False
+            self._segments.clear()
+            self._size = 0
+            self._thread = None
+            self._active_readers = 0
+            self._cond.notify_all()
+        try:
+            os.remove(PROGRESSIVE_TS_PATH)
+        except FileNotFoundError:
+            pass
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            generation = self._generation
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(generation,),
+                daemon=True,
+            )
+            self._thread.start()
+
+    def size(self) -> int:
+        with self._lock:
+            return self._size
+
+    def restart_at_live_edge_if_idle(self) -> bool:
+        with self._lock:
+            should_restart = self._size > 0 and self._active_readers == 0
+        if not should_restart:
+            return False
+
+        self.reset()
+        self.start()
+        return True
+
+    def acquire_reader(self) -> None:
+        with self._lock:
+            self._active_readers += 1
+
+    def release_reader(self) -> None:
+        with self._lock:
+            self._active_readers = max(0, self._active_readers - 1)
+
+    def wait_for_size(self, size: int, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._size < size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=min(remaining, 0.25))
+            return True
+
+    def read_at(self, offset: int, max_bytes: int) -> bytes:
+        if offset < 0 or max_bytes <= 0:
+            return b""
+        with self._lock:
+            available = self._size
+        if offset >= available:
+            return b""
+
+        length = min(max_bytes, available - offset)
+        try:
+            with open(PROGRESSIVE_TS_PATH, "rb") as file:
+                file.seek(offset)
+                return file.read(length)
+        except OSError:
+            return b""
+
+    @staticmethod
+    def _playlist_segments() -> list[str]:
+        playlist = os.path.join(HLS_DIR, "stream.m3u8")
+        try:
+            with open(playlist, "r", encoding="utf-8", errors="replace") as file:
+                lines = file.read().splitlines()
+        except OSError:
+            return []
+
+        return [
+            line.strip() for line in lines
+            if line.strip().endswith(".ts") and "/" not in line.strip()
+        ]
+
+    def _append_segment(self, segment: str, generation: int) -> None:
+        local_path = os.path.join(HLS_DIR, segment)
+        try:
+            with open(local_path, "rb") as source:
+                data = source.read()
+        except OSError:
+            return
+        if not data:
+            return
+
+        with self._cond:
+            if not (self._started and self._generation == generation):
+                return
+            with open(PROGRESSIVE_TS_PATH, "ab") as output:
+                output.write(data)
+            self._segments.add(segment)
+            self._size += len(data)
+            self._cond.notify_all()
+
+    def _is_current_generation(self, generation: int) -> bool:
+        with self._lock:
+            return self._started and self._generation == generation
+
+    def _run(self, generation: int) -> None:
+        os.makedirs(HLS_DIR, exist_ok=True)
+        try:
+            open(PROGRESSIVE_TS_PATH, "wb").close()
+        except OSError:
+            return
+
+        while self._is_current_generation(generation):
+            segments = self._playlist_segments()
+            if not segments:
+                time.sleep(0.05)
+                continue
+
+            with self._lock:
+                empty = self._size == 0
+                known = set(self._segments)
+
+            if empty:
+                pending = segments[-1:]
+            else:
+                pending = [segment for segment in segments if segment not in known]
+
+            if not pending:
+                time.sleep(0.05)
+                continue
+
+            for segment in pending:
+                self._append_segment(segment, generation)
+
+
+_progressive_ts = ProgressiveTS()
+
+
 class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
-    """Serves low-latency HLS files with Range support for Samsung DLNA."""
+    """Serves HLS files and the progressive TS bridge for Samsung DLNA."""
 
     protocol_version = "HTTP/1.1"
     _log_lock = threading.Lock()
@@ -299,6 +461,171 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _parse_progressive_range(
+        self,
+    ) -> Optional[tuple[int, int, bool, int]]:
+        raw = self.headers.get("Range")
+        if not raw:
+            return None
+        if not raw.startswith("bytes=") or "," in raw:
+            return None
+
+        start_text, _, end_text = raw[6:].partition("-")
+        advertised_size = PROGRESSIVE_TS_SIZE
+        try:
+            if start_text == "":
+                suffix_len = int(end_text)
+                if suffix_len <= 0:
+                    return None
+                return max(0, advertised_size - suffix_len), advertised_size - 1, True, advertised_size
+
+            start = int(start_text)
+            has_explicit_end = bool(end_text)
+            if start < 0:
+                return None
+
+            if start >= advertised_size:
+                advertised_size = start + PROGRESSIVE_TS_SIZE
+            end = int(end_text) if has_explicit_end else advertised_size - 1
+        except ValueError:
+            return None
+
+        if end < start:
+            return None
+        return start, end, has_explicit_end, advertised_size
+
+    def _send_progressive_ts_headers(
+        self,
+        status: int,
+        start: int,
+        end: int,
+        advertised_size: int,
+    ) -> None:
+        length = end - start + 1
+        self.close_connection = True
+        self.send_response(status)
+        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.send_header("Connection", "close")
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", TS_CONTENT_FEATURES)
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{advertised_size}")
+        self.end_headers()
+
+    def _send_progressive_range_error(self, current_size: int) -> None:
+        self.close_connection = True
+        self.send_response(416)
+        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", f"bytes */{current_size}")
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", TS_CONTENT_FEATURES)
+        self.end_headers()
+
+    def _serve_progressive_ts(self, send_body: bool) -> None:
+        _progressive_ts.start()
+
+        request_range = self.headers.get("Range")
+        byte_range = self._parse_progressive_range()
+        current_size = _progressive_ts.size()
+
+        if request_range and byte_range is None:
+            self._send_progressive_range_error(current_size)
+            print(
+                f"[FluxCast Server] progressive-ts rejected invalid range from "
+                f"{self.client_address[0]} (416, current={current_size // 1024} KiB, "
+                f"Range: {request_range})"
+            )
+            return
+
+        if byte_range is None:
+            start, end, has_explicit_end = 0, PROGRESSIVE_TS_SIZE - 1, False
+            advertised_size = PROGRESSIVE_TS_SIZE
+            status = 200
+        else:
+            start, end, has_explicit_end, advertised_size = byte_range
+            status = 206
+
+        read_start = start
+        live_seek_suffix = ""
+        is_future_seek = start > current_size + PROGRESSIVE_TS_SEEK_TOLERANCE
+        if is_future_seek:
+            read_start = current_size
+            live_seek_suffix = f", live-seek {start}->{read_start}"
+
+        restart_suffix = ""
+        if send_body and (start == 0 or is_future_seek) and _progressive_ts.restart_at_live_edge_if_idle():
+            current_size = _progressive_ts.size()
+            read_start = 0 if is_future_seek else start
+            restart_suffix = ", live-edge restart"
+
+        reader_acquired = False
+        if send_body:
+            _progressive_ts.acquire_reader()
+            reader_acquired = True
+            wait_before_headers = not is_future_seek
+            if wait_before_headers and not _progressive_ts.wait_for_size(read_start + 1, timeout=10.0):
+                _progressive_ts.release_reader()
+                reader_acquired = False
+                self._send_empty(503)
+                print(
+                    f"[FluxCast Server] progressive-ts has no data for "
+                    f"{self.client_address[0]} (503, start={start}, read_start={read_start})"
+                )
+                return
+
+        self._send_progressive_ts_headers(status, start, end, advertised_size)
+        if not send_body:
+            return
+
+        range_suffix = f", Range: {request_range}" if request_range else ""
+        print(
+            f"[FluxCast Server] progressive-ts -> {self.client_address[0]} "
+            f"({status}, start={start}, current={_progressive_ts.size() // 1024} KiB"
+            f"{restart_suffix}{live_seek_suffix}{range_suffix})"
+        )
+
+        sent = 0
+        total_length = end - start + 1
+        started_at = time.monotonic()
+        try:
+            while sent < total_length:
+                offset = read_start + sent
+                if not _progressive_ts.wait_for_size(offset + 1, timeout=15.0):
+                    break
+
+                chunk = _progressive_ts.read_at(
+                    offset,
+                    min(PROGRESSIVE_TS_CHUNK_SIZE, total_length - sent),
+                )
+                if not chunk:
+                    time.sleep(0.03)
+                    continue
+
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                sent += len(chunk)
+
+                if has_explicit_end and sent >= total_length:
+                    return
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if reader_acquired:
+                _progressive_ts.release_reader()
+            elapsed = time.monotonic() - started_at
+            print(
+                f"[FluxCast Server] progressive-ts closed for {self.client_address[0]} "
+                f"(sent={sent // 1024} KiB, {elapsed:.1f}s{live_seek_suffix})"
+            )
+
     def _serve_file(self, send_body: bool) -> None:
         local_path = self._local_path()
         if local_path is None or not os.path.isfile(local_path):
@@ -346,13 +673,21 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def do_HEAD(self):
-        if _url_path(self.path).endswith("/live.ts"):
+        path = _url_path(self.path)
+        if path.endswith("/progressive.ts"):
+            self._serve_progressive_ts(send_body=False)
+            return
+        if path.endswith("/live.ts"):
             self._serve_live_ts(send_body=False)
             return
         self._serve_file(send_body=False)
 
     def do_GET(self):
-        if _url_path(self.path).endswith("/live.ts"):
+        path = _url_path(self.path)
+        if path.endswith("/progressive.ts"):
+            self._serve_progressive_ts(send_body=True)
+            return
+        if path.endswith("/live.ts"):
             self._serve_live_ts(send_body=True)
             return
         self._serve_file(send_body=True)
@@ -367,6 +702,7 @@ class StreamServer:
 
     def start(self, capture_process=None) -> None:
         os.makedirs(HLS_DIR, exist_ok=True)
+        _progressive_ts.reset()
         self._server = http.server.ThreadingHTTPServer(
             (self.host, self.port), HLSRequestHandler
         )
@@ -376,3 +712,5 @@ class StreamServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
+        _progressive_ts.reset()

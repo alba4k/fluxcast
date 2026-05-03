@@ -148,6 +148,25 @@ def _double_bitrate(value: str) -> str:
     return amount_text + suffix
 
 
+def _bitrate_to_kbits(value: str) -> Optional[int]:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
+    if not match:
+        return None
+
+    amount = float(match.group(1))
+    suffix = match.group(2).lower()
+    if suffix == "g":
+        amount *= 1_000_000
+    elif suffix == "m":
+        amount *= 1_000
+    elif suffix == "k":
+        amount *= 1
+    else:
+        amount /= 1_000
+
+    return max(1, round(amount))
+
+
 def _terminate_stale_processes() -> None:
     """Stop FluxCast children left behind by interrupted runs."""
     if not shutil.which("pgrep"):
@@ -238,6 +257,21 @@ def start_capture(
             "format=yuv420p",
         ]
 
+    x264_params = [
+        f"keyint={gop}",
+        f"min-keyint={gop}",
+        "scenecut=0",
+        "repeat-headers=1",
+        "aud=1",
+    ]
+    vbv_maxrate = _bitrate_to_kbits(bitrate)
+    vbv_bufsize = _bitrate_to_kbits(_double_bitrate(bitrate))
+    if vbv_maxrate and vbv_bufsize:
+        x264_params.extend([
+            f"vbv-maxrate={vbv_maxrate}",
+            f"vbv-bufsize={vbv_bufsize}",
+        ])
+
     # ── Process 1: wf-recorder (video only, writes encoded H.264/NUT to stdout) ──
     wf_cmd = [
         "wf-recorder",
@@ -251,7 +285,7 @@ def start_capture(
         "-p", "tune=zerolatency",
         "-p", "pix_fmt=yuv420p",
         "-p", "profile=main",
-        "-p", f"x264-params=keyint={gop}:min-keyint={gop}:scenecut=0:repeat-headers=1:aud=1",
+        "-p", f"x264-params={':'.join(x264_params)}",
         "-f", "/dev/stdout",  # write to stdout
     ]
 
@@ -332,6 +366,8 @@ def start_capture(
     print(f"[FluxCast] Capturing screen : {monitor.name} via Wayland ({src_res})")
     print(f"[FluxCast] Capturing audio  : {audio_monitor}")
     print(f"[FluxCast] Video pipeline    : {'re-encode' if reencode_video else 'copy'}")
+    if vbv_maxrate and vbv_bufsize:
+        print(f"[FluxCast] Video bitrate cap : {vbv_maxrate}k max / {vbv_bufsize}k buffer")
     print(f"[FluxCast] HLS segment time  : {hls_time}s")
     if out_res != src_res:
         print(f"[FluxCast] Scaling output to: {out_res}")

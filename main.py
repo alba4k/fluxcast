@@ -12,7 +12,9 @@ Usage:
     --fps N                  Frames per second (default: 30)
     --bitrate Xm             Video bitrate (default: 4M)
     --discover-timeout N     mDNS/UPnP scan timeout (default: 5)
-    --transport hls|live-ts  hls = stable Samsung HLS mode (default)
+    --transport progressive-ts|hls|live-ts
+                             progressive-ts = low-latency Samsung mode (default)
+                             hls = stable Samsung HLS fallback
                              live-ts = experimental MPEG-TS mode
     --tv-ip IP               (For cast protocol only: direct IP connection)
 """
@@ -62,10 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discover-timeout", type=int, default=5,
                         dest="discover_timeout",
                         help="Discovery timeout in seconds (default: 5)")
-    parser.add_argument("--transport", default="hls",
-                        choices=["live-ts", "hls"],
-                        help="DLNA stream transport: hls for stable Samsung playback "
-                             "or live-ts for experimental low latency")
+    parser.add_argument("--transport", default="progressive-ts",
+                        choices=["progressive-ts", "hls", "live-ts"],
+                        help="DLNA stream transport: progressive-ts for low latency "
+                             "(default), hls as a stable fallback, or live-ts experimental")
     return parser.parse_args()
 
 
@@ -126,7 +128,12 @@ def main() -> None:
 
     host = args.host or get_local_ip()
     session_id = f"session-{int(time.time())}"
-    stream_name = "live.ts" if args.transport == "live-ts" else "stream.m3u8"
+    if args.transport == "live-ts":
+        stream_name = "live.ts"
+    elif args.transport == "progressive-ts":
+        stream_name = "progressive.ts"
+    else:
+        stream_name = "stream.m3u8"
     stream_path = f"{session_id}/{stream_name}"
     stream_url = f"http://{host}:{args.port}/{stream_path}"
 
