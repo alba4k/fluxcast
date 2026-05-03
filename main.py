@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import glob
+import os
 import signal
 import socket
 import time
@@ -24,7 +25,7 @@ import sys
 import termios
 
 from capture import prompt_monitor, start_capture, stop_capture
-from server import StreamServer
+from server import HLS_DIR, StreamServer
 
 
 def get_local_ip() -> str:
@@ -83,6 +84,35 @@ def _restore_term(saved) -> None:
         pass
 
 
+def _wait_for_hls_segments(required_segments: int = 2, timeout: float = 15.0) -> bool:
+    playlist = os.path.join(HLS_DIR, "stream.m3u8")
+    start = time.monotonic()
+
+    while time.monotonic() - start < timeout:
+        segments = []
+        for path in glob.glob(os.path.join(HLS_DIR, "stream*.ts")):
+            try:
+                if os.path.getsize(path) > 0:
+                    segments.append(path)
+            except OSError:
+                pass
+        if os.path.exists(playlist) and os.path.getsize(playlist) > 0:
+            try:
+                with open(playlist, "r", encoding="utf-8", errors="replace") as file:
+                    playlist_text = file.read()
+            except OSError:
+                playlist_text = ""
+            listed_segments = playlist_text.count(".ts")
+            if listed_segments >= required_segments and len(segments) >= required_segments:
+                waited = time.monotonic() - start
+                print(f" ready! ({len(segments)} segments, {waited:.1f}s)")
+                return True
+        time.sleep(0.2)
+
+    print(" [TIMEOUT]")
+    return False
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -133,21 +163,16 @@ def main() -> None:
     )
     print("[FluxCast] Screen capture started.")
 
-    # HTTP server
+    # HTTP server — serves the HLS playlist and MPEG-TS segments from /tmp/fluxcast.
     stream_server = StreamServer(host="0.0.0.0", port=args.port)
-    stream_server.start(ffmpeg_procs[0])
+    stream_server.start()
     print(f"[FluxCast] HTTP server: {stream_url}")
 
-    import glob
-    print("[FluxCast] Waiting for first HLS segment…", end="", flush=True)
-    waited = 0.0
-    while not glob.glob("/tmp/fluxcast/stream*.ts"):
-        time.sleep(0.2)
-        waited += 0.2
-        if waited > 15:
-            print(" [TIMEOUT]")
-            break
-    print(f" ready! ({waited:.1f}s)")
+    print("[FluxCast] Waiting for HLS stream to start…", end="", flush=True)
+    if not _wait_for_hls_segments(required_segments=2, timeout=15.0):
+        print("[FluxCast] ERROR: ffmpeg produced no playable HLS segments.")
+        shutdown()
+    print("[FluxCast] HLS is producing segments ✓")
 
     if args.protocol == "dlna":
         from dlna import discover_devices, prompt_device, start_cast

@@ -10,6 +10,9 @@ except ImportError:
     sys.exit(1)
 
 
+DLNA_PROTOCOL_INFO = "http-get:*:application/x-mpegurl:*"
+
+
 def discover_devices(timeout: int = 5) -> list:
     print(f"[FluxCast] Searching for UPnP/DLNA Cast devices (timeout={timeout}s)…")
     devices = upnpclient.discover(timeout=timeout)
@@ -63,7 +66,7 @@ def _build_didl_metadata(stream_url: str) -> str:
         <item id="1" parentID="0" restricted="1">
             <upnp:class>object.item.videoItem</upnp:class>
             <dc:title>FluxCast Screen Mirroring</dc:title>
-            <res protocolInfo="http-get:*:application/x-mpegurl:*">{escape(stream_url)}</res>
+            <res protocolInfo="{DLNA_PROTOCOL_INFO}">{escape(stream_url)}</res>
         </item>
     </DIDL-Lite>"""
     return didl
@@ -75,6 +78,12 @@ def start_cast(device, stream_url: str) -> None:
     didl_metadata = _build_didl_metadata(stream_url)
     
     try:
+        try:
+            device.AVTransport.Stop(InstanceID=0)
+            time.sleep(0.2)
+        except Exception:
+            pass
+
         # Load URL via DIDL-Lite
         device.AVTransport.SetAVTransportURI(
             InstanceID=0,
