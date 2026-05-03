@@ -1,6 +1,7 @@
 import sys
 import time
 from typing import Optional
+from urllib.parse import urlsplit
 
 try:
     import upnpclient
@@ -10,7 +11,21 @@ except ImportError:
     sys.exit(1)
 
 
-DLNA_PROTOCOL_INFO = "http-get:*:application/x-mpegurl:*"
+HLS_PROTOCOL_INFO = "http-get:*:application/x-mpegurl:*"
+TS_PROTOCOL_INFO = (
+    "http-get:*:video/mpeg:"
+    "DLNA.ORG_PN=AVC_TS_MP_HD_AAC;"
+    "DLNA.ORG_OP=01;"
+    "DLNA.ORG_CI=0;"
+    "DLNA.ORG_FLAGS=01700000000000000000000000000000"
+)
+
+
+def _protocol_info(stream_url: str) -> str:
+    path = urlsplit(stream_url).path
+    if path.endswith(".m3u8"):
+        return HLS_PROTOCOL_INFO
+    return TS_PROTOCOL_INFO
 
 
 def discover_devices(timeout: int = 5) -> list:
@@ -66,7 +81,7 @@ def _build_didl_metadata(stream_url: str) -> str:
         <item id="1" parentID="0" restricted="1">
             <upnp:class>object.item.videoItem</upnp:class>
             <dc:title>FluxCast Screen Mirroring</dc:title>
-            <res protocolInfo="{DLNA_PROTOCOL_INFO}">{escape(stream_url)}</res>
+            <res protocolInfo="{_protocol_info(stream_url)}">{escape(stream_url)}</res>
         </item>
     </DIDL-Lite>"""
     return didl

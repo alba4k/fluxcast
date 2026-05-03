@@ -12,6 +12,8 @@ Usage:
     --fps N                  Frames per second (default: 30)
     --bitrate Xm             Video bitrate (default: 4M)
     --discover-timeout N     mDNS/UPnP scan timeout (default: 5)
+    --transport hls|live-ts  hls = stable Samsung HLS mode (default)
+                             live-ts = experimental MPEG-TS mode
     --tv-ip IP               (For cast protocol only: direct IP connection)
 """
 
@@ -60,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discover-timeout", type=int, default=5,
                         dest="discover_timeout",
                         help="Discovery timeout in seconds (default: 5)")
+    parser.add_argument("--transport", default="hls",
+                        choices=["live-ts", "hls"],
+                        help="DLNA stream transport: hls for stable Samsung playback "
+                             "or live-ts for experimental low latency")
     return parser.parse_args()
 
 
@@ -119,7 +125,10 @@ def main() -> None:
     args = parse_args()
 
     host = args.host or get_local_ip()
-    stream_url = f"http://{host}:{args.port}/stream.m3u8"
+    session_id = f"session-{int(time.time())}"
+    stream_name = "live.ts" if args.transport == "live-ts" else "stream.m3u8"
+    stream_path = f"{session_id}/{stream_name}"
+    stream_url = f"http://{host}:{args.port}/{stream_path}"
 
     _tty_state = _save_term() # save before ffmpeg corrupts it
 
@@ -167,12 +176,14 @@ def main() -> None:
     stream_server = StreamServer(host="0.0.0.0", port=args.port)
     stream_server.start()
     print(f"[FluxCast] HTTP server: {stream_url}")
+    print(f"[FluxCast] Session: {session_id}")
+    print(f"[FluxCast] Transport: {args.transport}")
 
-    print("[FluxCast] Waiting for HLS stream to start…", end="", flush=True)
+    print("[FluxCast] Waiting for HLS source to start…", end="", flush=True)
     if not _wait_for_hls_segments(required_segments=2, timeout=15.0):
         print("[FluxCast] ERROR: ffmpeg produced no playable HLS segments.")
         shutdown()
-    print("[FluxCast] HLS is producing segments ✓")
+    print("[FluxCast] HLS source is producing segments ✓")
 
     if args.protocol == "dlna":
         from dlna import discover_devices, prompt_device, start_cast
