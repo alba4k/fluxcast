@@ -49,7 +49,6 @@ def _content_features(path: str) -> str:
 
 
 class ProgressiveTS:
-    """Builds one byte-addressable MPEG-TS stream from fresh HLS segments."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

@@ -4,8 +4,9 @@ FluxCast entry point
 Usage:
     python main.py [OPTIONS]
 
-    --protocol dlna|cast     dlna = UPnP native screening (default, like Windows Cast to Device)
+    --protocol dlna|cast|wfd dlna = UPnP native screening (default, reliable fallback)
                              cast = pychromecast (needs Chromecast built-in)
+                             wfd = experimental Miracast/Wi-Fi Display path
     --host HOST              LAN IP to advertise to the TV (default: auto-detect)
     --port PORT              HTTP server port (default: 8080)
     --output-res WxH         Scale output (e.g. 1920x1080); default: native
@@ -16,6 +17,11 @@ Usage:
                              progressive-ts = low-latency Samsung mode (default)
                              hls = stable Samsung HLS fallback
                              live-ts = experimental MPEG-TS mode
+    --doctor                 Print passive Linux/WFD capability diagnostics
+    --wfd-scan               Run an active Wi-Fi Direct peer scan via wpa_cli
+    --wfd-peer PEER          WFD peer selector for --protocol wfd (index, MAC, name)
+    --wfd-dry-run            Print WFD connection D-Bus call without activating it
+    --wfd-test-pattern       Stream a generated test pattern instead of the desktop
     --tv-ip IP               (For cast protocol only: direct IP connection)
 """
 
@@ -46,9 +52,10 @@ def parse_args() -> argparse.Namespace:
         description="FluxCast — stream your Arch Linux desktop to a Smart TV"
     )
     parser.add_argument("--protocol", default="dlna",
-                        choices=["dlna", "cast"],
+                        choices=["dlna", "cast", "wfd"],
                         help="Connection protocol: dlna (UPnP, default) "
-                             "or cast (pychromecast / Chromecast built-in)")
+                             "cast (pychromecast / Chromecast built-in), "
+                             "or wfd (experimental Miracast/Wi-Fi Display)")
     parser.add_argument("--tv-ip", default=None, dest="tv_ip",
                         help="TV IP address (only applicable for --protocol cast)")
     parser.add_argument("--host", default=None,
@@ -68,6 +75,36 @@ def parse_args() -> argparse.Namespace:
                         choices=["progressive-ts", "hls", "live-ts"],
                         help="DLNA stream transport: progressive-ts for low latency "
                              "(default), hls as a stable fallback, or live-ts experimental")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Print passive Linux/WFD capability diagnostics and exit")
+    parser.add_argument("--doctor-json", action="store_true", dest="doctor_json",
+                        help="Print diagnostics as JSON and exit")
+    parser.add_argument("--wfd-scan", action="store_true", dest="wfd_scan",
+                        help="Run active Wi-Fi Direct discovery and exit")
+    parser.add_argument("--wfd-peer", default=None, dest="wfd_peer",
+                        help="WFD peer selector for --protocol wfd: index, MAC, or name")
+    parser.add_argument("--wfd-dry-run", action="store_true", dest="wfd_dry_run",
+                        help="Print WFD connection D-Bus call without activating it")
+    parser.add_argument("--wfd-test-pattern", action="store_true", dest="wfd_test_pattern",
+                        help="For --protocol wfd, stream generated test video instead of the desktop")
+    parser.add_argument("--wfd-test-audio", action="store_true", dest="wfd_test_audio",
+                        help="Legacy flag for --wfd-test-pattern (AAC test audio is enabled by default)")
+    parser.add_argument("--wfd-media-pipeline", default="auto",
+                        choices=["auto", "ffmpeg", "gst"],
+                        dest="wfd_media_pipeline",
+                        help="For --protocol wfd, RTP media sender: auto (stable ffmpeg), ffmpeg, or gst")
+    parser.add_argument("--wfd-no-audio", action="store_true", dest="wfd_no_audio",
+                        help="For --protocol wfd, stream video only")
+    parser.add_argument("--wfd-audio-device", default=None, dest="wfd_audio_device",
+                        help="Pulse/PipeWire monitor source for --protocol wfd audio")
+    parser.add_argument("--wfd-rtsp-port", type=int, default=7236, dest="wfd_rtsp_port",
+                        help="RTSP port advertised in WFD IEs (default: 7236)")
+    parser.add_argument("--wfd-rtp-source-port", type=int, default=19002, dest="wfd_rtp_source_port",
+                        help="Local RTP source port for --protocol wfd (default: 19002)")
+    parser.add_argument("--wfd-interface", default=None, dest="wfd_interface",
+                        help="Wi-Fi interface to use for --wfd-scan, e.g. wlan0")
+    parser.add_argument("--wfd-timeout", type=int, default=8, dest="wfd_timeout",
+                        help="Wi-Fi Direct scan timeout in seconds (default: 8)")
     return parser.parse_args()
 
 
@@ -126,6 +163,34 @@ def _wait_for_hls_segments(required_segments: int = 2, timeout: float = 15.0) ->
 def main() -> None:
     args = parse_args()
 
+    if args.doctor or args.doctor_json:
+        from diagnostics import print_report, run_diagnostics
+        report = run_diagnostics()
+        if args.doctor_json:
+            print(report.to_json())
+        else:
+            print_report(report)
+        return
+
+    if args.wfd_scan:
+        from wfd import WFDNotReady, active_scan, print_scan
+        try:
+            peers = active_scan(interface=args.wfd_interface, timeout=args.wfd_timeout)
+        except WFDNotReady as exc:
+            print(f"[FluxCast WFD] ERROR: {exc}")
+            sys.exit(1)
+        print_scan(peers)
+        return
+
+    if args.protocol == "wfd":
+        from wfd import WFDNotReady, start_experimental_backend
+        try:
+            start_experimental_backend(args)
+        except WFDNotReady as exc:
+            print(f"[FluxCast WFD] ERROR: {exc}")
+            sys.exit(1)
+        return
+
     host = args.host or get_local_ip()
     session_id = f"session-{int(time.time())}"
     if args.transport == "live-ts":
@@ -151,8 +216,8 @@ def main() -> None:
                     from dlna import stop_cast
                     stop_cast(tv)
                 else:
-                    from cast import cast
-                    cast.stop_cast(tv)
+                    import cast as cast_backend
+                    cast_backend.stop_cast(tv)
             except Exception:
                 pass
         if stream_server:
@@ -179,7 +244,7 @@ def main() -> None:
     )
     print("[FluxCast] Screen capture started.")
 
-    # HTTP server — serves the HLS playlist and MPEG-TS segments from /tmp/fluxcast.
+    # HTTP server serves the HLS playlist and MPEG-TS segments from /tmp/fluxcast.
     stream_server = StreamServer(host="0.0.0.0", port=args.port)
     stream_server.start()
     print(f"[FluxCast] HTTP server: {stream_url}")

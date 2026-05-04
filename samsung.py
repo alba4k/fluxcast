@@ -24,7 +24,6 @@ except ImportError:
     sys.exit(1)
 
 APP_NAME = "FluxCast"
-# Samsung browser app IDs (try in order)
 BROWSER_APP_IDS = [
     "org.tizen.browser",
     "org.tizen.crnt.applicationDock",

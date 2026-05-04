@@ -1,0 +1,1832 @@
+import re
+import random
+import socketserver
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, replace
+from typing import Optional
+
+from diagnostics import print_report, run_diagnostics
+
+
+WFD_RTSP_PORT = 7236
+WFD_SOURCE_IE_TEMPLATE = bytes.fromhex("00000600901c4400c8")
+
+# WFD CEA resolution bitmask. The current backend intentionally negotiates
+# only the common HD modes that Samsung TVs usually accept reliably.
+WFD_CEA_720P30 = 0x00000020   # bit 5: 1280x720p30, mandatory HD mode
+WFD_CEA_720P60 = 0x00000040   # bit 6: 1280x720p60
+WFD_CEA_1080P30 = 0x00000080  # bit 7: 1920x1080p30
+WFD_CEA_1080P60 = 0x00000100  # bit 8: 1920x1080p60
+WFD_LEVEL_31 = 0x01
+WFD_LEVEL_32 = 0x02
+WFD_LEVEL_40 = 0x04
+WFD_LEVEL_42 = 0x10
+WFD_AUDIO_AAC = "AAC 00000001 00"
+NM_DEST = "org.freedesktop.NetworkManager"
+NM_PATH = "/org/freedesktop/NetworkManager"
+
+
+@dataclass
+class WFDPeer:
+    address: str
+    name: str = ""
+    details: str = ""
+    path: str = ""
+    source: str = ""
+
+
+class WFDNotReady(RuntimeError):
+    pass
+
+
+@dataclass
+class RTSPMessage:
+    start: str
+    headers: dict[str, str]
+    raw_headers: list[str]
+    body: str = ""
+
+    @property
+    def is_response(self) -> bool:
+        return self.start.startswith("RTSP/")
+
+    @property
+    def method(self) -> str:
+        if self.is_response:
+            return ""
+        return self.start.split(maxsplit=1)[0] if self.start else ""
+
+    @property
+    def cseq(self) -> str:
+        return self.headers.get("cseq", "0")
+
+    @property
+    def status(self) -> str:
+        if not self.is_response:
+            return ""
+        parts = self.start.split(maxsplit=2)
+        return " ".join(parts[1:]) if len(parts) >= 2 else ""
+
+
+@dataclass
+class WFDMediaConfig:
+    monitor: Optional[object]
+    fps: int = 30
+    bitrate: str = "4M"
+    output_resolution: Optional[str] = None
+    audio_device: Optional[str] = None
+    no_audio: bool = False
+    test_pattern: bool = False
+    source_port: int = 19002
+    media_pipeline: str = "auto"
+
+
+@dataclass
+class WFDVideoFormat:
+    native: str
+    preferred: str
+    profile: str
+    level: str
+    cea_mask: int
+    vesa_mask: int
+    hh_mask: int
+
+
+@dataclass(frozen=True)
+class WFDCEAMode:
+    name: str
+    bit: int
+    native: str
+    width: int
+    height: int
+    fps: int
+
+    @property
+    def resolution(self) -> str:
+        return f"{self.width}x{self.height}"
+
+
+WFD_CEA_MODES: dict[int, WFDCEAMode] = {
+    WFD_CEA_720P30: WFDCEAMode("1280x720p30", WFD_CEA_720P30, "28", 1280, 720, 30),
+    WFD_CEA_720P60: WFDCEAMode("1280x720p60", WFD_CEA_720P60, "30", 1280, 720, 60),
+    WFD_CEA_1080P30: WFDCEAMode("1920x1080p30", WFD_CEA_1080P30, "38", 1920, 1080, 30),
+    WFD_CEA_1080P60: WFDCEAMode("1920x1080p60", WFD_CEA_1080P60, "40", 1920, 1080, 60),
+}
+
+
+def _parse_resolution(value: Optional[str]) -> Optional[tuple[int, int]]:
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d+)x(\d+)\s*", value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _detect_audio_monitor() -> str:
+    try:
+        sink = subprocess.check_output(
+            ["pactl", "get-default-sink"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if sink:
+            return sink + ".monitor"
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "short", "sinks"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if "RUNNING" in line:
+                return line.split("\t")[1] + ".monitor"
+    except Exception:
+        pass
+    return "default"
+
+
+def _gst_has_element(name: str) -> bool:
+    if not shutil.which("gst-inspect-1.0"):
+        return False
+    try:
+        result = subprocess.run(
+            ["gst-inspect-1.0", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _gst_wfd_sender_available() -> bool:
+    return (
+        shutil.which("gst-launch-1.0") is not None
+        and _gst_has_element("mpegtsmux")
+        and _gst_has_element("rtpmp2tpay")
+        and _gst_has_element("x264enc")
+    )
+
+
+def _gst_pick_aac_encoder() -> tuple[str, list[str]]:
+    """
+    Pick a broadly available AAC encoder and a compatible raw-audio caps filter.
+    """
+    if _gst_has_element("fdkaacenc"):
+        # fdkaacenc is strict on sample format on many distros.
+        return "fdkaacenc", ["audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"]
+    if _gst_has_element("avenc_aac"):
+        return "avenc_aac", ["audio/x-raw,rate=48000,channels=2"]
+    if _gst_has_element("voaacenc"):
+        return "voaacenc", ["audio/x-raw,rate=48000,channels=2"]
+    if _gst_has_element("faac"):
+        return "faac", ["audio/x-raw,rate=48000,channels=2"]
+    raise WFDNotReady(
+        "No usable GStreamer AAC encoder found (tried fdkaacenc, avenc_aac, voaacenc, faac)."
+    )
+
+
+def _double_bitrate(value: str) -> str:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
+    if not match:
+        return value
+    amount = float(match.group(1)) * 2
+    suffix = match.group(2)
+    amount_text = str(int(amount)) if amount.is_integer() else f"{amount:g}"
+    return amount_text + suffix
+
+
+def _bitrate_to_kbits(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
+    if not match:
+        return 4000
+
+    amount = float(match.group(1))
+    suffix = match.group(2).lower()
+    if suffix == "g":
+        amount *= 1_000_000
+    elif suffix == "m":
+        amount *= 1_000
+    elif suffix == "k":
+        amount *= 1
+    else:
+        amount /= 1_000
+    return max(1, round(amount))
+
+
+def _parse_sink_video_format(value: str) -> Optional[WFDVideoFormat]:
+    first_codec = value.split(",", 1)[0]
+    tokens = first_codec.split()
+    if len(tokens) < 11 or tokens[0].lower() == "none":
+        return None
+    try:
+        return WFDVideoFormat(
+            native=tokens[0],
+            preferred=tokens[1],
+            profile=tokens[2],
+            level=tokens[3],
+            cea_mask=int(tokens[4], 16),
+            vesa_mask=int(tokens[5], 16),
+            hh_mask=int(tokens[6], 16),
+        )
+    except ValueError:
+        return None
+
+
+def _choose_profile(profile_hex: str) -> str:
+    try:
+        profile_mask = int(profile_hex, 16)
+    except ValueError:
+        return profile_hex
+    if profile_mask & 0x01:
+        return "01"
+    if profile_mask & 0x02:
+        return "02"
+    return f"{profile_mask & 0xff:02x}"
+
+
+def _max_wfd_level(level_hex: str) -> Optional[int]:
+    try:
+        value = int(level_hex, 16)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    highest = 1
+    while highest << 1 <= value:
+        highest <<= 1
+    return highest
+
+
+def _wfd_level_for_mode(mode: WFDCEAMode) -> int:
+    if mode.width <= 1280 and mode.height <= 720:
+        return WFD_LEVEL_31 if mode.fps <= 30 else WFD_LEVEL_32
+    return WFD_LEVEL_40 if mode.fps <= 30 else WFD_LEVEL_42
+
+
+def _desired_resolution(config: WFDMediaConfig) -> Optional[tuple[int, int]]:
+    resolution = _parse_resolution(config.output_resolution)
+    if resolution is not None:
+        return resolution
+    if config.monitor is not None:
+        monitor = config.monitor
+        return monitor.width, monitor.height
+    return None
+
+
+def _choose_cea_mode(
+    config: WFDMediaConfig,
+    sink_format: Optional[WFDVideoFormat],
+) -> WFDCEAMode:
+    supported = sink_format.cea_mask if sink_format else (
+        WFD_CEA_720P30 | WFD_CEA_720P60 | WFD_CEA_1080P30 | WFD_CEA_1080P60
+    )
+    max_level = _max_wfd_level(sink_format.level) if sink_format else WFD_LEVEL_42
+    resolution = _desired_resolution(config)
+    wants_720 = resolution is None or (resolution[0] <= 1280 and resolution[1] <= 720)
+    wants_60 = config.fps > 30
+
+    def supports(bit: int) -> bool:
+        if not (supported & bit):
+            return False
+        mode = WFD_CEA_MODES[bit]
+        return max_level is None or _wfd_level_for_mode(mode) <= max_level
+
+    if wants_720:
+        preferred = (
+            [WFD_CEA_720P60, WFD_CEA_720P30]
+            if wants_60 else [WFD_CEA_720P30, WFD_CEA_720P60]
+        )
+    else:
+        preferred = (
+            [WFD_CEA_1080P60, WFD_CEA_1080P30, WFD_CEA_720P60, WFD_CEA_720P30]
+            if wants_60 else [
+                WFD_CEA_1080P30,
+                WFD_CEA_720P30,
+                WFD_CEA_1080P60,
+                WFD_CEA_720P60,
+            ]
+        )
+
+    for bit in preferred:
+        if supports(bit):
+            return WFD_CEA_MODES[bit]
+
+    for bit in (
+        WFD_CEA_720P30,
+        WFD_CEA_1080P30,
+        WFD_CEA_720P60,
+        WFD_CEA_1080P60,
+    ):
+        if supports(bit):
+            return WFD_CEA_MODES[bit]
+
+    raise WFDNotReady(
+        "The sink did not advertise a supported 720p/1080p CEA WFD mode. "
+        f"CEA mask was 0x{supported:08x}, "
+        f"H.264 level was {sink_format.level if sink_format else 'unknown'}."
+    )
+
+
+def _selected_video_format(
+    config: WFDMediaConfig,
+    sink_format: Optional[WFDVideoFormat],
+) -> str:
+    mode = _choose_cea_mode(config, sink_format)
+
+    profile = _choose_profile(sink_format.profile) if sink_format else "01"
+    level = f"{_wfd_level_for_mode(mode):02x}"
+    return (
+        f"{mode.native} 00 {profile} {level} {mode.bit:08x} "
+        "00000000 00000000 00 0000 0000 00 none none"
+    )
+
+
+def _h264_level_for_mode(config: WFDMediaConfig) -> str:
+    resolution = _parse_resolution(config.output_resolution) or (1920, 1080)
+    width, height = resolution
+    if width <= 1280 and height <= 720:
+        return "3.1" if config.fps <= 30 else "3.2"
+    return "4.0" if config.fps <= 30 else "4.2"
+
+
+def _safe_source_port(requested: int, sink_port: int, sink_rtcp_port: int = 0) -> int:
+    blocked = {sink_port}
+    if sink_rtcp_port:
+        blocked.add(sink_rtcp_port)
+    else:
+        blocked.add(sink_port + 1)
+
+    port = requested
+    if port % 2:
+        port += 1
+    while port in blocked or port + 1 in blocked:
+        port += 2
+    return port
+
+
+def _rtp_url(tv_ip: str, sink_port: int, source_port: int, local_ip: str) -> str:
+    # Bind both RTP and RTCP to the ports advertised in the RTSP SETUP reply.
+    # ffmpeg's pkt_size is the whole UDP payload, including the 12-byte RTP
+    # header. WFD receivers expect seven 188-byte TS packets per RTP payload:
+    # 12 + (7 * 188) = 1328 bytes.
+    return (
+        f"rtp://{tv_ip}:{sink_port}"
+        f"?localaddr={local_ip}"
+        f"&local_rtpport={source_port}"
+        f"&local_rtcpport={source_port + 1}"
+        "&pkt_size=1328"
+    )
+
+
+def _interface_for_ip(local_ip: str) -> Optional[str]:
+    if not shutil.which("ip"):
+        return None
+    try:
+        result = _run(["ip", "-o", "-4", "addr", "show"], timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    needle = f" {local_ip}/"
+    for line in result.stdout.splitlines():
+        if needle not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            return parts[1].split("@", 1)[0]
+    return None
+
+
+def _netdev_tx_bytes(interface: Optional[str]) -> Optional[int]:
+    if not interface:
+        return None
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8", errors="replace") as file:
+            lines = file.read().splitlines()
+    except OSError:
+        return None
+
+    prefix = interface + ":"
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        _, _, counters = stripped.partition(":")
+        fields = counters.split()
+        if len(fields) >= 16:
+            try:
+                return int(fields[8])
+            except ValueError:
+                return None
+    return None
+
+
+class WFDMediaPipeline:
+    def __init__(
+        self,
+        config: WFDMediaConfig,
+        tv_ip: str,
+        local_ip: str,
+        sink_rtp_port: int,
+    ) -> None:
+        self.config = config
+        self.tv_ip = tv_ip
+        self.local_ip = local_ip
+        self.sink_rtp_port = sink_rtp_port
+        self.processes: list[subprocess.Popen[bytes]] = []
+        self.tx_interface: Optional[str] = None
+        self.tx_baseline: Optional[int] = None
+        self.started_at = 0.0
+
+    def start(self) -> None:
+        if self.processes:
+            return
+
+        self.started_at = time.monotonic()
+        self.tx_interface = _interface_for_ip(self.local_ip)
+        self.tx_baseline = _netdev_tx_bytes(self.tx_interface)
+
+        requested_pipeline = self.config.media_pipeline
+        pipeline = requested_pipeline
+        if pipeline == "auto":
+            # Prefer ffmpeg for stability across Samsung WFD receivers.
+            # GStreamer sender remains available as an explicit opt-in.
+            pipeline = "ffmpeg"
+
+        if pipeline == "gst":
+            if not self.config.test_pattern:
+                raise WFDNotReady("GStreamer WFD sender is currently implemented for --wfd-test-pattern only.")
+            try:
+                self._start_gst_test_pattern()
+            except WFDNotReady:
+                # In auto mode, transparently fall back to ffmpeg if gst startup fails.
+                if requested_pipeline == "auto":
+                    print("[FluxCast WFD Media] GStreamer sender failed to start; falling back to ffmpeg.")
+                    self._start_test_pattern()
+                else:
+                    raise
+        elif self.config.test_pattern:
+            self._start_test_pattern()
+        else:
+            self._start_desktop()
+
+    def tx_summary(self) -> str:
+        current = _netdev_tx_bytes(self.tx_interface)
+        if self.tx_baseline is None or current is None:
+            return "tx=unknown"
+        delta = max(0, current - self.tx_baseline)
+        return f"tx+{delta // 1024} KiB on {self.tx_interface}"
+
+    def stop(self) -> None:
+        for proc in self.processes:
+            if proc.poll() is None:
+                proc.terminate()
+
+        for proc in self.processes:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self.processes.clear()
+
+    def _rtp_output(self) -> str:
+        return _rtp_url(self.tv_ip, self.sink_rtp_port, self.config.source_port, self.local_ip)
+
+    def _common_output_args(self) -> list[str]:
+        """
+        Low-latency RTP/MPEG-TS output args.
+
+        ffmpeg accepts the MPEG-TS private options here even when the outer
+        muxer is rtp_mpegts, which keeps this compatible with older builds.
+        """
+        return [
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-flush_packets", "1",
+            "-mpegts_flags", "resend_headers+pat_pmt_at_frames",
+            "-pat_period", "0.1",
+            "-pcr_period", "20",
+            "-f", "rtp_mpegts",
+            self._rtp_output(),
+        ]
+
+    def _start_test_pattern(self) -> None:
+        if not shutil.which("ffmpeg"):
+            raise WFDNotReady("ffmpeg is required for WFD test-pattern streaming.")
+
+        resolution = self.config.output_resolution or "1280x720"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-loglevel", "warning",
+            "-re",
+            "-f", "lavfi",
+            "-i", f"testsrc2=size={resolution}:rate={self.config.fps}",
+        ]
+
+        if not self.config.no_audio:
+            cmd += [
+                "-re",
+                "-f", "lavfi",
+                "-i", "sine=frequency=880:sample_rate=48000",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ]
+        else:
+            cmd += ["-map", "0:v:0"]
+
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-level:v", _h264_level_for_mode(self.config),
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.config.fps),
+            "-g", str(max(1, self.config.fps)),
+            "-keyint_min", str(max(1, self.config.fps)),
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-b:v", self.config.bitrate,
+            "-maxrate", self.config.bitrate,
+            "-bufsize", _double_bitrate(self.config.bitrate),
+            "-x264-params", "repeat-headers=1:aud=1",
+        ]
+
+        if not self.config.no_audio:
+            cmd += [
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "128k",
+                "-ac", "2",
+                "-ar", "48000",
+            ]
+
+        cmd += self._common_output_args()
+
+        print(
+            f"[FluxCast WFD Media] Starting test RTP stream to "
+            f"{self.tv_ip}:{self.sink_rtp_port} from local port {self.config.source_port}"
+        )
+        proc = subprocess.Popen(cmd)  # stderr/stdout visible for debugging
+        time.sleep(0.8)
+        if proc.poll() is not None:
+            raise WFDNotReady("ffmpeg test-pattern pipeline exited immediately.")
+        self.processes = [proc]
+
+    def _start_gst_test_pattern(self) -> None:
+        if not shutil.which("gst-launch-1.0"):
+            raise WFDNotReady("gst-launch-1.0 is required for the GStreamer WFD test-pattern pipeline.")
+        if not _gst_wfd_sender_available():
+            raise WFDNotReady(
+                "GStreamer WFD test-pattern pipeline needs mpegtsmux, rtpmp2tpay, and x264enc."
+            )
+
+        resolution = _parse_resolution(self.config.output_resolution) or (1280, 720)
+        width, height = resolution
+        bitrate_kbits = _bitrate_to_kbits(self.config.bitrate)
+
+        prog_map = "program_map,sink_4113=1"
+        if not self.config.no_audio:
+            prog_map += ",sink_4352=1"
+
+        cmd = [
+            "gst-launch-1.0", "-e", "-q",
+            "mpegtsmux", "name=mux",
+            "alignment=7",
+            f"prog-map={prog_map}",
+            "pat-interval=9000",
+            "pmt-interval=9000",
+            "pcr-interval=3600",
+            "!", "rtpmp2tpay", "pt=33", "mtu=1328",
+            "!", "udpsink",
+            f"host={self.tv_ip}",
+            f"port={self.sink_rtp_port}",
+            f"bind-address={self.local_ip}",
+            f"bind-port={self.config.source_port}",
+            "sync=false",
+            "async=false",
+            "videotestsrc", "is-live=true", "pattern=smpte",
+            "!", f"video/x-raw,width={width},height={height},framerate={self.config.fps}/1",
+            "!", "videoconvert",
+            "!", "x264enc",
+            "tune=zerolatency",
+            "speed-preset=ultrafast",
+            f"bitrate={bitrate_kbits}",
+            f"key-int-max={max(1, self.config.fps)}",
+            "bframes=0",
+            "byte-stream=true",
+            "aud=true",
+            "sliced-threads=true",
+            "vbv-buf-capacity=200",
+            "!", "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline",
+            "!", "queue",
+            "!", "mux.sink_4113",
+        ]
+
+        if not self.config.no_audio:
+            audio_encoder, audio_caps = _gst_pick_aac_encoder()
+            cmd += [
+                "audiotestsrc", "is-live=true", "wave=sine", "freq=880",
+                "!", "audioconvert",
+                "!", "audioresample",
+                "!", *audio_caps,
+                "!", audio_encoder, "bitrate=128000",
+                "!", "aacparse",
+                "!", "queue",
+                "!", "mux.sink_4352",
+            ]
+
+        print(
+            f"[FluxCast WFD Media] Starting GStreamer test RTP stream to "
+            f"{self.tv_ip}:{self.sink_rtp_port} from {self.local_ip}:{self.config.source_port}"
+        )
+        # Print command for debugging
+        print(f"[FluxCast WFD Media] GST cmd: {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd)  # stderr/stdout visible for debugging
+        time.sleep(0.8)
+        if proc.poll() is not None:
+            raise WFDNotReady("GStreamer test-pattern pipeline exited immediately.")
+        self.processes = [proc]
+
+    def _start_desktop(self) -> None:
+        if not shutil.which("wf-recorder"):
+            raise WFDNotReady("wf-recorder is required for WFD desktop streaming.")
+        if not shutil.which("ffmpeg"):
+            raise WFDNotReady("ffmpeg is required for WFD desktop streaming.")
+        if self.config.monitor is None:
+            raise WFDNotReady("WFD desktop streaming needs a selected monitor.")
+
+        monitor = self.config.monitor
+        src_res = f"{monitor.width}x{monitor.height}"
+        out_res = self.config.output_resolution or src_res
+        audio_monitor = self.config.audio_device or _detect_audio_monitor()
+        gop = max(1, self.config.fps)
+
+        wf_cmd = [
+            "wf-recorder",
+            "-y",
+            "-D",
+            "-r", str(self.config.fps),
+            "-o", monitor.name,
+            "-c", "rawvideo",
+            "-m", "nut",
+            "-p", "pix_fmt=yuv420p",
+            "-f", "/dev/stdout",
+        ]
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-loglevel", "warning",
+            "-fflags", "+genpts",
+            "-thread_queue_size", "1024",
+            "-f", "nut",
+            "-i", "pipe:0",
+        ]
+
+        if not self.config.no_audio:
+            ffmpeg_cmd += [
+                "-thread_queue_size", "1024",
+                "-f", "pulse",
+                "-i", audio_monitor,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ]
+        else:
+            ffmpeg_cmd += ["-map", "0:v:0"]
+
+        if out_res == src_res:
+            ffmpeg_cmd += ["-vf", "format=yuv420p"]
+        else:
+            ffmpeg_cmd += ["-vf", f"scale={out_res.replace('x', ':')}:out_range=tv,format=yuv420p"]
+
+        ffmpeg_cmd += [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-level:v", _h264_level_for_mode(self.config),
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.config.fps),
+            "-g", str(gop),
+            "-keyint_min", str(gop),
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-b:v", self.config.bitrate,
+            "-maxrate", self.config.bitrate,
+            "-bufsize", _double_bitrate(self.config.bitrate),
+            "-x264-params", "repeat-headers=1:aud=1",
+        ]
+
+        if not self.config.no_audio:
+            ffmpeg_cmd += [
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "128k",
+                "-ac", "2",
+                "-ar", "48000",
+            ]
+
+        ffmpeg_cmd += self._common_output_args()
+
+        print(f"[FluxCast WFD Media] Capturing screen : {monitor.name} ({src_res})")
+        if not self.config.no_audio:
+            print(f"[FluxCast WFD Media] Capturing audio  : {audio_monitor}")
+        if out_res != src_res:
+            print(f"[FluxCast WFD Media] Scaling output  : {out_res}")
+        print(
+            f"[FluxCast WFD Media] RTP target      : "
+            f"{self.tv_ip}:{self.sink_rtp_port} from local port {self.config.source_port}"
+        )
+
+        wf_proc = subprocess.Popen(wf_cmd, stdout=subprocess.PIPE, stderr=None)
+        if wf_proc.stdout is None:
+            wf_proc.kill()
+            raise WFDNotReady("wf-recorder did not expose stdout.")
+
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=wf_proc.stdout, stderr=None)
+        wf_proc.stdout.close()
+        time.sleep(1.0)
+
+        if wf_proc.poll() is not None:
+            ffmpeg_proc.terminate()
+            raise WFDNotReady("wf-recorder exited immediately during WFD streaming.")
+        if ffmpeg_proc.poll() is not None:
+            wf_proc.terminate()
+            raise WFDNotReady("ffmpeg exited immediately during WFD streaming.")
+
+        self.processes = [wf_proc, ffmpeg_proc]
+
+
+def _read_rtsp_message(rfile) -> Optional[RTSPMessage]:
+    lines = []
+    while True:
+        raw = rfile.readline(8192)
+        if not raw:
+            return None
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if line == "":
+            break
+        lines.append(line)
+
+    if not lines:
+        return None
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if sep:
+            headers[key.strip().lower()] = value.strip()
+
+    content_length = 0
+    try:
+        content_length = int(headers.get("content-length", "0"))
+    except ValueError:
+        content_length = 0
+
+    body = ""
+    if content_length > 0:
+        body = rfile.read(content_length).decode("utf-8", errors="replace")
+
+    return RTSPMessage(
+        start=lines[0],
+        headers=headers,
+        raw_headers=lines[1:],
+        body=body,
+    )
+
+
+def _parse_parameters(body: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for line in body.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            params[key.strip().lower()] = value.strip()
+    return params
+
+
+def _parse_rtp_ports(value: str) -> Optional[tuple[int, int]]:
+    match = re.search(
+        r"RTP/AVP/(?:UDP|TCP);unicast\s+(\d+)\s+(\d+)\s+mode=play",
+        value,
+        re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _parse_transport_client_ports(value: str) -> Optional[tuple[int, int]]:
+    match = re.search(r"client_port=(\d+)(?:-(\d+))?", value, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2) or "0")
+    return None
+
+
+class _WFDRTSPHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        self.local_ip = self.request.getsockname()[0]
+        self.next_cseq = 1
+        self.pending: dict[str, str] = {}
+        self.session_id = str(random.randint(1_000_000, 9_999_999))
+        self.sink_rtp_port: Optional[int] = None
+        self.sink_rtcp_port: int = 0
+        self.source_rtp_port = self.media_config.source_port
+        self.sink_video_format: Optional[WFDVideoFormat] = None
+        self.sink_audio_codecs = ""
+        self.negotiated_no_audio = False
+        self.m3_sent = False
+        self.media: Optional[WFDMediaPipeline] = None
+
+        print(f"[FluxCast WFD RTSP] TV connected from {peer}; local={self.local_ip}")
+        try:
+            self._send_m1_options()
+            while True:
+                msg = _read_rtsp_message(self.rfile)
+                if msg is None:
+                    print(f"[FluxCast WFD RTSP] TV disconnected from {peer}")
+                    return
+                self._log_message(msg)
+                if msg.is_response:
+                    self._handle_response(msg)
+                else:
+                    self._handle_request(msg)
+        except WFDNotReady as exc:
+            print(f"[FluxCast WFD RTSP] ERROR: {exc}")
+        except OSError as exc:
+            print(f"[FluxCast WFD RTSP] Socket closed: {exc}")
+        finally:
+            self._stop_media()
+
+    @property
+    def media_config(self) -> WFDMediaConfig:
+        return self.server.media_config  # type: ignore[attr-defined]
+
+    @property
+    def rtsp_port(self) -> int:
+        return self.server.server_address[1]  # type: ignore[attr-defined]
+
+    def _rtsp_control_uri(self) -> str:
+        return "rtsp://localhost/wfd1.0"
+
+    def _rtsp_presentation_uri(self) -> str:
+        return f"rtsp://{self.local_ip}:{self.rtsp_port}/wfd1.0"
+
+    def _cea_mode(self) -> WFDCEAMode:
+        return _choose_cea_mode(self.media_config, self.sink_video_format)
+
+    def _video_format(self) -> str:
+        return _selected_video_format(self.media_config, self.sink_video_format)
+
+    def _audio_codecs(self) -> str:
+        if self.media_config.no_audio or self.negotiated_no_audio:
+            return "none"
+        return WFD_AUDIO_AAC
+
+    def _send_bytes(self, text: str) -> None:
+        self.wfile.write(text.encode("utf-8"))
+        self.wfile.flush()
+
+    def _send_request(
+        self,
+        name: str,
+        method: str,
+        uri: str,
+        headers: Optional[dict[str, str]] = None,
+        body: str = "",
+    ) -> None:
+        cseq = str(self.next_cseq)
+        self.next_cseq += 1
+        self.pending[cseq] = name
+
+        output = [
+            f"{method} {uri} RTSP/1.0",
+            f"CSeq: {cseq}",
+        ]
+        for key, value in (headers or {}).items():
+            output.append(f"{key}: {value}")
+        if body:
+            output.append("Content-Type: text/parameters")
+            output.append(f"Content-Length: {len(body.encode('utf-8'))}")
+        output.append("")
+        output.append(body)
+        self._send_bytes("\r\n".join(output))
+        print(f"[FluxCast WFD RTSP] -> {name}: {method} (CSeq {cseq})")
+        if body:
+            for line in body.splitlines():
+                if line.startswith("wfd_"):
+                    print(f"[FluxCast WFD RTSP]   {line}")
+
+    def _send_response(
+        self,
+        msg: RTSPMessage,
+        status: str = "200 OK",
+        headers: Optional[dict[str, str]] = None,
+        body: str = "",
+    ) -> None:
+        output = [
+            f"RTSP/1.0 {status}",
+            f"CSeq: {msg.cseq}",
+            "Server: FluxCast-WFD/0.1",
+        ]
+        for key, value in (headers or {}).items():
+            output.append(f"{key}: {value}")
+        if body:
+            output.append("Content-Type: text/parameters")
+        output.append(f"Content-Length: {len(body.encode('utf-8'))}")
+        output.append("")
+        output.append(body)
+        self._send_bytes("\r\n".join(output))
+        print(f"[FluxCast WFD RTSP] -> response {status} for {msg.method or msg.status}")
+
+    def _send_m1_options(self) -> None:
+        self._send_request(
+            "M1_OPTIONS",
+            "OPTIONS",
+            "*",
+            headers={"Require": "org.wfa.wfd1.0"},
+        )
+
+    def _send_m3_get_parameters(self) -> None:
+        if self.m3_sent:
+            return
+        self.m3_sent = True
+        body = (
+            "wfd_video_formats\r\n"
+            "wfd_audio_codecs\r\n"
+            "wfd_client_rtp_ports\r\n"
+        )
+        self._send_request(
+            "M3_GET_PARAMETER",
+            "GET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _send_m4_set_parameters(self) -> None:
+        if not self.sink_rtp_port:
+            raise WFDNotReady("Samsung did not provide a valid RTP port in M3.")
+        sink_rtcp_port = self.sink_rtcp_port if self.sink_rtcp_port > 0 else 0
+        body = (
+            f"wfd_video_formats: {self._video_format()}\r\n"
+            f"wfd_audio_codecs: {self._audio_codecs()}\r\n"
+            f"wfd_presentation_URL: {self._rtsp_presentation_uri()}/streamid=0 none\r\n"
+            "wfd_client_rtp_ports: RTP/AVP/UDP;unicast "
+            f"{self.sink_rtp_port} {sink_rtcp_port} mode=play\r\n"
+        )
+        self._send_request(
+            "M4_SET_PARAMETER",
+            "SET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _send_m5_trigger_setup(self) -> None:
+        body = "wfd_trigger_method: SETUP\r\n"
+        self._send_request(
+            "M5_TRIGGER_SETUP",
+            "SET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _handle_response(self, msg: RTSPMessage) -> None:
+        name = self.pending.pop(msg.cseq, "UNKNOWN")
+        if not msg.status.startswith("200"):
+            raise WFDNotReady(f"RTSP {name} failed: {msg.start}")
+
+        print(f"[FluxCast WFD RTSP] <- response for {name}: {msg.status}")
+        if name == "M3_GET_PARAMETER":
+            params = _parse_parameters(msg.body)
+            ports = _parse_rtp_ports(params.get("wfd_client_rtp_ports", ""))
+            if not ports or ports[0] <= 0:
+                raise WFDNotReady(
+                    "Samsung M3 response did not include a usable wfd_client_rtp_ports value."
+                )
+            self.sink_rtp_port, self.sink_rtcp_port = ports
+            self.source_rtp_port = _safe_source_port(
+                self.media_config.source_port,
+                self.sink_rtp_port,
+                self.sink_rtcp_port,
+            )
+            self.sink_video_format = _parse_sink_video_format(
+                params.get("wfd_video_formats", "")
+            )
+            audio = params.get("wfd_audio_codecs", "")
+            self.sink_audio_codecs = audio
+            if (
+                audio
+                and not self.media_config.no_audio
+                and "AAC" not in audio.upper()
+            ):
+                self.negotiated_no_audio = True
+                print(
+                    "[FluxCast WFD RTSP] TV did not advertise AAC; "
+                    "falling back to video-only WFD."
+                )
+            mode = self._cea_mode()
+            print(
+                f"[FluxCast WFD RTSP] Samsung RTP port: {self.sink_rtp_port}; "
+                f"source port: {self.source_rtp_port}; audio={audio or 'unknown'}"
+            )
+            print(f"[FluxCast WFD RTSP] Negotiated media mode: {mode.name}")
+            print(f"[FluxCast WFD RTSP] Selected video format: {self._video_format()}")
+            self._send_m4_set_parameters()
+        elif name == "M1_OPTIONS":
+            self._send_m3_get_parameters()
+        elif name == "M4_SET_PARAMETER":
+            self._send_m5_trigger_setup()
+
+    def _handle_request(self, msg: RTSPMessage) -> None:
+        method = msg.method
+        if method == "OPTIONS":
+            self._send_response(
+                msg,
+                headers={
+                    "Public": (
+                        "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, "
+                        "GET_PARAMETER, SET_PARAMETER"
+                    )
+                },
+            )
+            self._send_m3_get_parameters()
+            return
+
+        if method == "GET_PARAMETER":
+            requested = msg.body.lower()
+            lines = []
+            if "wfd_video_formats" in requested:
+                lines.append(f"wfd_video_formats: {self._video_format()}\r\n")
+            if "wfd_audio_codecs" in requested:
+                lines.append(f"wfd_audio_codecs: {self._audio_codecs()}\r\n")
+            if "wfd_content_protection" in requested:
+                lines.append("wfd_content_protection: none\r\n")
+            body = "".join(lines)
+            self._send_response(msg, headers=self._session_header(), body=body)
+            return
+
+        if method == "SET_PARAMETER":
+            if "wfd_idr_request" in msg.body:
+                print(
+                    "[FluxCast WFD RTSP] Samsung requested an IDR frame; "
+                    "next GOP is <= 1s"
+                )
+            self._send_response(msg, headers=self._session_header())
+            return
+
+        if method == "SETUP":
+            ports = _parse_transport_client_ports(msg.headers.get("transport", ""))
+            if ports:
+                self.sink_rtp_port, self.sink_rtcp_port = ports
+            if not self.sink_rtp_port:
+                self.sink_rtp_port = 19000
+                self.sink_rtcp_port = 0
+
+            self.source_rtp_port = _safe_source_port(
+                self.media_config.source_port,
+                self.sink_rtp_port,
+                self.sink_rtcp_port,
+            )
+            source_port = self.source_rtp_port
+            if self.sink_rtcp_port:
+                transport = (
+                    "RTP/AVP/UDP;unicast;"
+                    f"client_port={self.sink_rtp_port}-{self.sink_rtcp_port};"
+                    f"server_port={source_port}-{source_port + 1}"
+                )
+            else:
+                transport = (
+                    "RTP/AVP/UDP;unicast;"
+                    f"client_port={self.sink_rtp_port};"
+                    f"server_port={source_port}"
+                )
+            self._send_response(
+                msg,
+                headers={
+                    "Transport": transport,
+                    "Session": f"{self.session_id};timeout=30",
+                },
+            )
+            print(f"[FluxCast WFD RTSP] SETUP complete; RTP sink port={self.sink_rtp_port}")
+            return
+
+        if method == "PLAY":
+            self._send_response(
+                msg,
+                headers={
+                    **self._session_header(),
+                    "Range": "npt=now-",
+                },
+            )
+            self._start_media()
+            return
+
+        if method == "PAUSE":
+            self._send_response(msg, headers=self._session_header())
+            self._stop_media()
+            return
+
+        if method == "TEARDOWN":
+            self._send_response(
+                msg,
+                headers={
+                    **self._session_header(),
+                    "Connection": "close",
+                },
+            )
+            self._stop_media()
+            return
+
+        self._send_response(msg, status="405 Method Not Allowed")
+
+    def _session_header(self) -> dict[str, str]:
+        return {"Session": f"{self.session_id};timeout=30"}
+
+    def _start_media(self) -> None:
+        if not self.sink_rtp_port:
+            raise WFDNotReady("Cannot start media before the TV RTP port is known.")
+        if self.media is None:
+            mode = self._cea_mode()
+            effective_config = replace(
+                self.media_config,
+                source_port=self.source_rtp_port,
+                output_resolution=mode.resolution,
+                fps=mode.fps,
+                no_audio=self.media_config.no_audio or self.negotiated_no_audio,
+            )
+            print(
+                f"[FluxCast WFD RTSP] Starting media as {mode.name}; "
+                f"RTP source port {self.source_rtp_port}"
+            )
+            self.media = WFDMediaPipeline(
+                effective_config,
+                tv_ip=self.client_address[0],
+                local_ip=self.local_ip,
+                sink_rtp_port=self.sink_rtp_port,
+            )
+            self.media.start()
+            print("[FluxCast WFD RTSP] PLAY accepted; media stream started.")
+            self._schedule_probe(0.7)
+
+    def _schedule_probe(self, delay: float) -> None:
+        probe = threading.Timer(delay, self._probe_tx)
+        probe.daemon = True
+        probe.start()
+
+    def _probe_tx(self) -> None:
+        media = self.media
+        if media is None:
+            return
+
+        states = []
+        for proc in media.processes:
+            status = "running" if proc.poll() is None else f"exited={proc.returncode}"
+            states.append(f"pid={proc.pid}:{status}")
+
+        if states and all(proc.poll() is None for proc in media.processes):
+            print(
+                f"[FluxCast WFD Media] Sender health: "
+                f"{', '.join(states)}; {media.tx_summary()}"
+            )
+            self._schedule_probe(5.0)
+            return
+
+        detail = ", ".join(states) if states else "no sender process"
+        print(
+            f"[FluxCast WFD Media] WARNING: RTP sender is not healthy "
+            f"({detail}; {media.tx_summary()})"
+        )
+
+    def _stop_media(self) -> None:
+        if self.media is not None:
+            print("[FluxCast WFD Media] Stopping RTP stream...")
+            self.media.stop()
+            self.media = None
+
+    def _log_message(self, msg: RTSPMessage) -> None:
+        arrow = "<- response" if msg.is_response else "<- request"
+        print(f"[FluxCast WFD RTSP] {arrow}: {msg.start}")
+        for line in msg.raw_headers:
+            lower = line.lower()
+            if lower.startswith(("cseq:", "transport:", "session:", "content-type:", "content-length:")):
+                print(f"[FluxCast WFD RTSP]   {line}")
+        if msg.body:
+            for line in msg.body.splitlines():
+                if line.startswith("wfd_"):
+                    print(f"[FluxCast WFD RTSP]   {line}")
+
+
+class _ThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class WFDRTSPServer:
+    def __init__(
+        self,
+        media_config: WFDMediaConfig,
+        host: str = "0.0.0.0",
+        port: int = WFD_RTSP_PORT,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.media_config = media_config
+        self._server: Optional[socketserver.ThreadingTCPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._server = _ThreadingTCPServer((self.host, self.port), _WFDRTSPHandler)
+        self._server.media_config = self.media_config  # type: ignore[attr-defined]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        print(f"[FluxCast WFD RTSP] Server listening on {self.host}:{self.port}")
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+
+
+def _run(args: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _object_paths(text: str) -> list[str]:
+    return re.findall(r"'(/[^']+)'", text)
+
+
+def _variant_string(text: str) -> str:
+    match = re.search(r"<\'(.*)\' >", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"<\'(.*)\'", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"<\"(.*)\"", text)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _variant_uint(text: str) -> Optional[int]:
+    matches = re.findall(r"(?:uint32\s+)?(\d+)", text)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def _variant_uint_tuple(text: str) -> tuple[Optional[int], Optional[int]]:
+    matches = re.findall(r"(?:uint32\s+)?(\d+)", text)
+    if len(matches) < 2:
+        return None, None
+    return int(matches[-2]), int(matches[-1])
+
+
+NM_ACTIVE_STATE_NAMES = {
+    0: "unknown",
+    1: "activating",
+    2: "activated",
+    3: "deactivating",
+    4: "deactivated",
+}
+
+NM_DEVICE_STATE_NAMES = {
+    0: "unknown",
+    10: "unmanaged",
+    20: "unavailable",
+    30: "disconnected",
+    40: "prepare",
+    50: "config",
+    60: "need-auth",
+    70: "ip-config",
+    80: "ip-check",
+    90: "secondaries",
+    100: "activated",
+    110: "deactivating",
+    120: "failed",
+}
+
+NM_DEVICE_REASON_NAMES = {
+    0: "none",
+    1: "unknown",
+    2: "now-managed",
+    3: "now-unmanaged",
+    4: "config-failed",
+    5: "ip-config-unavailable",
+    6: "ip-config-expired",
+    7: "no-secrets",
+    8: "supplicant-disconnect",
+    9: "supplicant-config-failed",
+    10: "supplicant-failed",
+    11: "supplicant-timeout",
+    15: "dhcp-start-failed",
+    16: "dhcp-error",
+    17: "dhcp-failed",
+    18: "shared-start-failed",
+    19: "shared-failed",
+    38: "external-disconnect",
+    39: "assume-failed",
+    40: "supplicant-available",
+    41: "modem-not-found",
+    42: "bt-failed",
+    53: "peer-not-found",
+    54: "device-handler-failed",
+}
+
+
+def _gdbus_call(args: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    if not shutil.which("gdbus"):
+        raise WFDNotReady("gdbus is required for NetworkManager Wi-Fi P2P discovery.")
+    return _run(["gdbus", "call", "--system", *args], timeout=timeout)
+
+
+def _nm_get_property(path: str, interface: str, prop: str) -> str:
+    result = _gdbus_call([
+        "--dest", NM_DEST,
+        "--object-path", path,
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        interface,
+        prop,
+    ])
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _nm_get_string(path: str, interface: str, prop: str) -> str:
+    return _variant_string(_nm_get_property(path, interface, prop))
+
+
+def _nm_device_summary(path: str) -> str:
+    iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "Interface")
+    ip_iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "IpInterface")
+    state = _variant_uint(_nm_get_property(path, "org.freedesktop.NetworkManager.Device", "State"))
+    _, reason = _variant_uint_tuple(
+        _nm_get_property(path, "org.freedesktop.NetworkManager.Device", "StateReason")
+    )
+    state_text = NM_DEVICE_STATE_NAMES.get(state or -1, str(state))
+    reason_text = NM_DEVICE_REASON_NAMES.get(reason or -1, str(reason))
+    if ip_iface and ip_iface != iface:
+        return f"{iface}/{ip_iface}:{state_text}:{reason_text}"
+    return f"{iface}:{state_text}:{reason_text}"
+
+
+def _nm_active_devices(active_path: str) -> list[str]:
+    raw = _nm_get_property(
+        active_path,
+        "org.freedesktop.NetworkManager.Connection.Active",
+        "Devices",
+    )
+    return _object_paths(raw)
+
+
+def _wait_for_nm_activation(active_path: str, timeout: float = 35.0) -> None:
+    print("[FluxCast WFD] Waiting for NetworkManager P2P activation...")
+    deadline = time.monotonic() + timeout
+    last_status = ""
+
+    while time.monotonic() < deadline:
+        state_raw = _nm_get_property(
+            active_path,
+            "org.freedesktop.NetworkManager.Connection.Active",
+            "State",
+        )
+        state = _variant_uint(state_raw)
+        state_text = NM_ACTIVE_STATE_NAMES.get(state or -1, str(state))
+        devices = _nm_active_devices(active_path)
+        device_status = ", ".join(_nm_device_summary(path) for path in devices) or "no-device"
+        status = f"{state_text}; {device_status}"
+
+        if status != last_status:
+            print(f"[FluxCast WFD] NM active connection: {status}")
+            last_status = status
+
+        if state == 2:
+            print("[FluxCast WFD] P2P link is activated; waiting for Samsung RTSP...")
+            return
+        if state == 4:
+            raise WFDNotReady(
+                "NetworkManager deactivated the Wi-Fi Direct connection before RTSP. "
+                f"Last status: {status}"
+            )
+
+        time.sleep(0.5)
+
+    raise WFDNotReady(
+        "Timed out waiting for NetworkManager Wi-Fi Direct activation. "
+        f"Last status: {last_status or 'unknown'}"
+    )
+
+
+def _nm_p2p_device_path(interface: Optional[str] = None) -> Optional[str]:
+    result = _gdbus_call([
+        "--dest", NM_DEST,
+        "--object-path", NM_PATH,
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        "org.freedesktop.NetworkManager",
+        "Devices",
+    ])
+    if result.returncode != 0:
+        raise WFDNotReady((result.stderr or result.stdout).strip())
+
+    requested = interface or ""
+    for path in _object_paths(result.stdout):
+        iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "Interface")
+        if not iface or "p2p" not in iface.lower():
+            continue
+        if requested and requested not in iface:
+            continue
+        return path
+    return None
+
+
+def _nm_start_find(path: str, timeout: int) -> None:
+    result = _gdbus_call([
+        "--dest", NM_DEST,
+        "--object-path", path,
+        "--method", "org.freedesktop.NetworkManager.Device.WifiP2P.StartFind",
+        f"{{'timeout': <int32 {timeout}>}}",
+    ])
+    if result.returncode != 0:
+        raise WFDNotReady((result.stderr or result.stdout).strip())
+
+
+def _nm_stop_find(path: str) -> None:
+    try:
+        _gdbus_call([
+            "--dest", NM_DEST,
+            "--object-path", path,
+            "--method", "org.freedesktop.NetworkManager.Device.WifiP2P.StopFind",
+        ], timeout=3.0)
+    except Exception:
+        pass
+
+
+def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
+    path = _nm_p2p_device_path(interface)
+    if not path:
+        raise WFDNotReady("NetworkManager did not expose a Wi-Fi P2P device.")
+
+    iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "Interface") or path
+    print(f"[FluxCast WFD] Starting NetworkManager Wi-Fi Direct scan on {iface} for {timeout}s...")
+    _nm_start_find(path, timeout)
+    try:
+        time.sleep(max(1, timeout))
+        peers_raw = _nm_get_property(path, "org.freedesktop.NetworkManager.Device.WifiP2P", "Peers")
+    finally:
+        _nm_stop_find(path)
+
+    peers = []
+    for peer_path in _object_paths(peers_raw):
+        name = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Name")
+        address = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "HwAddress")
+        model = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Model")
+        manufacturer = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Manufacturer")
+        wfd_ies = _nm_get_property(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "WfdIEs")
+        details = "; ".join(
+            part for part in [
+                f"model={model}" if model else "",
+                f"manufacturer={manufacturer}" if manufacturer else "",
+                f"wfd_ies={wfd_ies}" if wfd_ies else "",
+            ]
+            if part
+        )
+        peers.append(WFDPeer(
+            address=address or peer_path.rsplit("/", 1)[-1],
+            name=name,
+            details=details,
+            path=peer_path,
+            source="NetworkManager",
+        ))
+    return peers
+
+
+def _variant_byte_array(data: bytes) -> str:
+    return "@ay [" + ", ".join(f"byte 0x{byte:02x}" for byte in data) + "]"
+
+
+def _wfd_source_ie(rtsp_port: int) -> bytes:
+    if rtsp_port <= 0 or rtsp_port > 65535:
+        raise WFDNotReady(f"Invalid WFD RTSP port: {rtsp_port}")
+    data = bytearray(WFD_SOURCE_IE_TEMPLATE)
+    data[5] = (rtsp_port >> 8) & 0xff
+    data[6] = rtsp_port & 0xff
+    return bytes(data)
+
+
+def _connection_settings(peer: WFDPeer, rtsp_port: int) -> str:
+    peer_address = peer.address
+    return (
+        "{"
+        "'connection': {"
+        "'id': <'FluxCast WFD'>, "
+        "'type': <'wifi-p2p'>, "
+        "'autoconnect': <false>"
+        "}, "
+        "'wifi-p2p': {"
+        f"'peer': <'{peer_address}'>, "
+        f"'wfd-ies': <{_variant_byte_array(_wfd_source_ie(rtsp_port))}>"
+        "}, "
+        "'ipv4': {'method': <'auto'>, 'never-default': <true>}, "
+        "'ipv6': {'method': <'auto'>, 'never-default': <true>, 'may-fail': <true>}"
+        "}"
+    )
+
+
+def _connect_peer(
+    device_path: str,
+    peer: WFDPeer,
+    rtsp_port: int = WFD_RTSP_PORT,
+    dry_run: bool = False,
+) -> str:
+    if not peer.path:
+        raise WFDNotReady("NetworkManager peer object path is required for P2P connection.")
+
+    settings = _connection_settings(peer, rtsp_port)
+    # Do not use bind-activation here: the gdbus CLI process exits right after
+    # the method call, and NetworkManager would tear the P2P link down with it.
+    options = "{'persist': <'volatile'>}"
+    args = [
+        "--dest", NM_DEST,
+        "--object-path", NM_PATH,
+        "--method", "org.freedesktop.NetworkManager.AddAndActivateConnection2",
+        settings,
+        device_path,
+        peer.path,
+        options,
+    ]
+    if dry_run:
+        print("[FluxCast WFD] Dry-run AddAndActivateConnection2:")
+        print("gdbus call --system " + " ".join(args))
+        return "/"
+
+    print(f"[FluxCast WFD] Connecting to {peer.name or peer.address} via NetworkManager...")
+    result = _gdbus_call(args, timeout=30.0)
+    text = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise WFDNotReady(text)
+
+    paths = _object_paths(text)
+    active = paths[-1] if paths else "/"
+    print(f"[FluxCast WFD] NetworkManager activation started: {text}")
+    return active
+
+
+def _disconnect_device(device_path: str) -> None:
+    result = _gdbus_call([
+        "--dest", NM_DEST,
+        "--object-path", device_path,
+        "--method", "org.freedesktop.NetworkManager.Device.Disconnect",
+    ], timeout=10.0)
+    text = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        print("[FluxCast WFD] NetworkManager P2P device disconnected.")
+    elif text:
+        print(f"[FluxCast WFD] NetworkManager disconnect warning: {text}")
+
+
+def _deactivate_connection(active_path: str) -> None:
+    if not active_path or active_path == "/":
+        return
+    result = _gdbus_call([
+        "--dest", NM_DEST,
+        "--object-path", NM_PATH,
+        "--method", "org.freedesktop.NetworkManager.DeactivateConnection",
+        active_path,
+    ], timeout=10.0)
+    text = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        print("[FluxCast WFD] NetworkManager P2P connection deactivated.")
+    elif text:
+        print(f"[FluxCast WFD] NetworkManager deactivate warning: {text}")
+
+
+def _select_peer(peers: list[WFDPeer], selector: Optional[str]) -> WFDPeer:
+    if not peers:
+        raise WFDNotReady("No Wi-Fi Direct peers found. Put the TV into Screen Share/Wireless Display mode.")
+    if selector is None:
+        if len(peers) == 1:
+            return peers[0]
+        print_scan(peers)
+        raw = input("Select WFD peer [0]: ").strip()
+        selector = raw or "0"
+
+    if selector.isdigit():
+        index = int(selector)
+        if 0 <= index < len(peers):
+            return peers[index]
+        raise WFDNotReady(f"Peer index out of range: {selector}")
+
+    normalized = selector.lower()
+    for peer in peers:
+        if normalized in peer.address.lower() or normalized in peer.name.lower():
+            return peer
+    raise WFDNotReady(f"No peer matched selector: {selector}")
+
+
+def _default_wifi_interface() -> Optional[str]:
+    if not shutil.which("iw"):
+        return None
+
+    try:
+        result = _run(["iw", "dev"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    current_iface = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Interface "):
+            current_iface = stripped.split(maxsplit=1)[1]
+        elif stripped == "type managed" and current_iface:
+            return current_iface
+    return None
+
+
+def _parse_peer_name(details: str) -> str:
+    for line in details.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("device_name="):
+            return stripped.partition("=")[2]
+    return ""
+
+
+def active_scan(interface: Optional[str] = None, timeout: int = 8) -> list[WFDPeer]:
+    """Run an active Wi-Fi Direct peer scan.
+
+    This does not connect to anything, but it may briefly put the Wi-Fi adapter
+    into P2P discovery/listen activity.
+    """
+    try:
+        return _nm_scan(interface=interface, timeout=timeout)
+    except WFDNotReady as nm_error:
+        print(f"[FluxCast WFD] NetworkManager scan unavailable: {nm_error}")
+
+    if not shutil.which("wpa_cli"):
+        raise WFDNotReady("wpa_cli is required for active Wi-Fi Direct scans.")
+
+    iface = interface or _default_wifi_interface()
+    if not iface:
+        raise WFDNotReady("Could not detect a managed Wi-Fi interface for wpa_cli.")
+
+    print(f"[FluxCast WFD] Starting Wi-Fi Direct scan on {iface} for {timeout}s...")
+    try:
+        start = _run(["wpa_cli", "-i", iface, "p2p_find", str(timeout)], timeout=5.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WFDNotReady(f"Could not start p2p_find: {exc}") from exc
+    if start.returncode != 0:
+        error = (start.stderr or start.stdout).strip()
+        if "Permission denied" in error:
+            raise WFDNotReady(
+                "wpa_cli cannot access the supplicant control interface. "
+                "This usually needs root, a ctrl_interface group, or a "
+                "NetworkManager D-Bus connection path. Raw error: " + error
+            )
+        raise WFDNotReady(error)
+
+    time.sleep(max(1, timeout))
+
+    try:
+        peers_result = _run(["wpa_cli", "-i", iface, "p2p_peers"], timeout=5.0)
+    finally:
+        try:
+            _run(["wpa_cli", "-i", iface, "p2p_stop_find"], timeout=3.0)
+        except Exception:
+            pass
+
+    if peers_result.returncode != 0:
+        raise WFDNotReady((peers_result.stderr or peers_result.stdout).strip())
+
+    peers = []
+    for raw in peers_result.stdout.splitlines():
+        address = raw.strip()
+        if not re.fullmatch(r"[0-9a-fA-F:]{17}", address):
+            continue
+
+        details = ""
+        try:
+            details_result = _run(["wpa_cli", "-i", iface, "p2p_peer", address], timeout=5.0)
+            if details_result.returncode == 0:
+                details = details_result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        peers.append(WFDPeer(
+            address=address,
+            name=_parse_peer_name(details),
+            details=details,
+            source="wpa_cli",
+        ))
+
+    return peers
+
+
+def print_scan(peers: list[WFDPeer]) -> None:
+    if not peers:
+        print("[FluxCast WFD] No Wi-Fi Direct peers found.")
+        return
+
+    print("[FluxCast WFD] Wi-Fi Direct peer(s):")
+    for idx, peer in enumerate(peers):
+        name = f"  {peer.name}" if peer.name else ""
+        source = f" via {peer.source}" if peer.source else ""
+        print(f"  [{idx}] {peer.address}{name}{source}")
+        if "wfd_subelems" in peer.details or "wfd_dev_info" in peer.details:
+            print("      WFD capability data detected")
+        elif "wfd_ies=" in peer.details:
+            print("      WFD capability data detected")
+
+
+def start_experimental_backend(args) -> None:
+    report = run_diagnostics()
+    print_report(report)
+    print()
+
+    if not report.wfd_candidate:
+        raise WFDNotReady(
+            "Miracast/WFD is not ready on this machine yet. "
+            "Fix the warn/fail rows above, then run --wfd-scan."
+        )
+
+    monitor = None
+    if not getattr(args, "wfd_test_pattern", False) and not getattr(args, "wfd_dry_run", False):
+        from capture import prompt_monitor
+        monitor = prompt_monitor()
+
+    peers = active_scan(interface=args.wfd_interface, timeout=args.wfd_timeout)
+    peer = _select_peer(peers, getattr(args, "wfd_peer", None))
+    device_path = _nm_p2p_device_path(args.wfd_interface)
+    if not device_path:
+        raise WFDNotReady("NetworkManager P2P device disappeared before connection.")
+
+    if getattr(args, "wfd_dry_run", False):
+        _connect_peer(
+            device_path,
+            peer,
+            rtsp_port=getattr(args, "wfd_rtsp_port", WFD_RTSP_PORT),
+            dry_run=True,
+        )
+        return
+
+    no_audio = getattr(args, "wfd_no_audio", False)
+    if getattr(args, "wfd_test_pattern", False):
+        if no_audio:
+            print("[FluxCast WFD] Test pattern smoke mode is video-only (--wfd-no-audio).")
+        else:
+            print(
+                "[FluxCast WFD] Test pattern smoke mode includes AAC audio by default. "
+                "Use --wfd-no-audio to isolate a video-only path."
+            )
+
+    media_config = WFDMediaConfig(
+        monitor=monitor,
+        fps=args.fps,
+        bitrate=args.bitrate,
+        output_resolution=args.output_res,
+        audio_device=getattr(args, "wfd_audio_device", None),
+        no_audio=no_audio,
+        test_pattern=getattr(args, "wfd_test_pattern", False),
+        source_port=getattr(args, "wfd_rtp_source_port", 19002),
+        media_pipeline=getattr(args, "wfd_media_pipeline", "auto"),
+    )
+
+    rtsp = WFDRTSPServer(
+        media_config=media_config,
+        port=getattr(args, "wfd_rtsp_port", WFD_RTSP_PORT),
+    )
+    connected = False
+    active_path = ""
+    try:
+        rtsp.start()
+        active_path = _connect_peer(
+            device_path,
+            peer,
+            rtsp_port=getattr(args, "wfd_rtsp_port", WFD_RTSP_PORT),
+        )
+        connected = True
+        _wait_for_nm_activation(active_path)
+        print("[FluxCast WFD] Waiting for Samsung RTSP/WFD session. Press Ctrl+C to stop.")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[FluxCast WFD] Stopping WFD session...")
+    finally:
+        rtsp.stop()
+        if connected:
+            _deactivate_connection(active_path)
+            _disconnect_device(device_path)

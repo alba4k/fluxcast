@@ -11,10 +11,6 @@ except ImportError:
 
 
 def discover_devices(timeout: int = 10) -> list:
-    """
-    Scan the local network for Cast-compatible devices.
-    Returns a list of pychromecast.Chromecast instances.
-    """
     print(f"[FluxCast] Searching for Cast devices (timeout={timeout}s)…")
     chromecasts, browser = pychromecast.get_chromecasts(timeout=timeout)
     pychromecast.discovery.stop_discovery(browser)
@@ -22,9 +18,6 @@ def discover_devices(timeout: int = 10) -> list:
 
 
 def connect_by_ip(ip: str, port: int = 8009):
-    """
-    Connect directly to ip address.
-    """
     print(f"[FluxCast] Connecting directly to Cast device at {ip}:{port}…")
     try:
         known = [f"{ip}:{port}"] if port != 8009 else [ip]
@@ -47,9 +40,6 @@ def connect_by_ip(ip: str, port: int = 8009):
 
 
 def prompt_device(devices: list):
-    """
-    Present found devices; auto-select first Samsung. Falls back to menu.
-    """
     if not devices:
         print("[FluxCast] ERROR: No Cast devices found on the network.")
         print("[FluxCast] TIP: Use --tv-ip <IP> to connect directly, e.g.:")

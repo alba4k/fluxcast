@@ -3,23 +3,22 @@ import os
 import re
 import subprocess
 import shutil
-import signal
 import sys
 import time
-from typing import Optional, NamedTuple, List
+from typing import Optional, NamedTuple
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/sbin/ffmpeg"
-HLS_DIR = "/tmp/fluxcast"
 
 
 class Monitor(NamedTuple):
     display: str
-    name: str    # e.g. 'eDP-1'
+    name: str # e.g. 'eDP-1'
     width: int
     height: int
-    x: int       # x offset within the combined framebuffer
+    x: int # x offset within the combined framebuffer
     y: int
-    refresh: float  # Hz
+    refresh: float # Hz
+
 
 
 def _detect_live_displays() -> list:
@@ -116,300 +115,67 @@ def prompt_monitor() -> Monitor:
         return monitors[default_idx]
 
 
-def _detect_audio_monitor() -> str:
-    """Return the .monitor PulseAudio source for the currently running sink."""
-    try:
-        sink = subprocess.check_output(
-            ["pactl", "get-default-sink"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        if sink:
-            return sink + ".monitor"
-    except Exception:
-        pass
-
-    try:
-        out = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True)
-        for line in out.splitlines():
-            if "RUNNING" in line:
-                return line.split('\t')[1] + ".monitor"
-    except Exception:
-        pass
-    return "default"
-
-
-def _double_bitrate(value: str) -> str:
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
-    if not match:
-        return value
-
-    amount = float(match.group(1)) * 2
-    suffix = match.group(2)
-    amount_text = str(int(amount)) if amount.is_integer() else f"{amount:g}"
-    return amount_text + suffix
-
-
-def _bitrate_to_kbits(value: str) -> Optional[int]:
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
-    if not match:
-        return None
-
-    amount = float(match.group(1))
-    suffix = match.group(2).lower()
-    if suffix == "g":
-        amount *= 1_000_000
-    elif suffix == "m":
-        amount *= 1_000
-    elif suffix == "k":
-        amount *= 1
-    else:
-        amount /= 1_000
-
-    return max(1, round(amount))
-
-
-def _terminate_stale_processes() -> None:
-    """Stop FluxCast children left behind by interrupted runs."""
-    if not shutil.which("pgrep"):
-        return
-
-    patterns = [
-        (r"/tmp/fluxcast/stream\.m3u8", "ffmpeg"),
-        (r"wf-recorder.*-m nut.*-f /dev/stdout", "wf-recorder"),
-    ]
-    current_pid = os.getpid()
-    stale_pids: list[tuple[int, str]] = []
-
-    for pattern, label in patterns:
-        try:
-            output = subprocess.check_output(
-                ["pgrep", "-f", pattern],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-        except subprocess.CalledProcessError:
-            continue
-
-        for raw_pid in output.split():
-            try:
-                pid = int(raw_pid)
-            except ValueError:
-                continue
-            if pid != current_pid:
-                stale_pids.append((pid, label))
-
-    if not stale_pids:
-        return
-
-    labels = ", ".join(f"{label}:{pid}" for pid, label in stale_pids)
-    print(f"[FluxCast] Cleaning stale capture processes: {labels}")
-
-    for pid, _ in stale_pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    time.sleep(0.3)
-
-    for pid, label in stale_pids:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-            print(f"[FluxCast] Force-killed stale {label}: {pid}")
-        except ProcessLookupError:
-            pass
-
-
 def start_capture(
     monitor: Monitor,
     fps: int = 30,
     bitrate: str = "4M",
     output_resolution: Optional[str] = None,
-) -> List["subprocess.Popen[bytes]"]:
-    """
-    Returns [wf_proc, ffmpeg_proc].  Both must be passed to stop_capture().
-    
-    Architecture:
-      wf-recorder (Wayland-native video) -> NUT pipe -> ffmpeg -> low-latency HLS
-    """
+) -> "subprocess.Popen[bytes]":
     src_res = f"{monitor.width}x{monitor.height}"
     out_res = output_resolution or src_res
-    hls_seconds = 1.0
-    hls_time = f"{hls_seconds:g}"
-    gop = max(1, round(fps * hls_seconds))
-    reencode_video = out_res != src_res
-
-    audio_monitor = _detect_audio_monitor()
-
-    _terminate_stale_processes()
-
-    if os.path.exists(HLS_DIR):
-        shutil.rmtree(HLS_DIR)
-    os.makedirs(HLS_DIR, exist_ok=True)
-
-    vf_filters = []
-    if out_res != src_res:
-        vf_filters = [
-            f"scale={out_res.replace('x', ':')}:out_range=tv",
-            "format=yuv420p",
-        ]
-
-    x264_params = [
-        f"keyint={gop}",
-        f"min-keyint={gop}",
-        "scenecut=0",
-        "repeat-headers=1",
-        "aud=1",
-    ]
-    vbv_maxrate = _bitrate_to_kbits(bitrate)
-    vbv_bufsize = _bitrate_to_kbits(_double_bitrate(bitrate))
-    if vbv_maxrate and vbv_bufsize:
-        x264_params.extend([
-            f"vbv-maxrate={vbv_maxrate}",
-            f"vbv-bufsize={vbv_bufsize}",
-        ])
-
-    # ── Process 1: wf-recorder (video only, writes encoded H.264/NUT to stdout) ──
-    wf_cmd = [
+    cmd = [
         "wf-recorder",
         "-y",
-        "-D",               # no-damage: constant FPS on static screens
+        "-D",
         "-r", str(fps),
-        "-o", monitor.name, # Wayland output name (e.g. HDMI-A-1)
+        "-a", # capture system audio
+        "-C", "aac",
+        "-P", "b:a=128k",
         "-c", "libx264",
-        "-m", "nut",        # NUT — pipe-friendly container, no seek index
+        "-m", "hls",
         "-p", "preset=ultrafast",
         "-p", "tune=zerolatency",
+        "-p", "hls_time=2",
+        "-p", "hls_list_size=6",
+        "-p", "hls_flags=append_list",
         "-p", "pix_fmt=yuv420p",
         "-p", "profile=main",
-        "-p", f"x264-params={':'.join(x264_params)}",
-        "-f", "/dev/stdout",  # write to stdout
+        "-f", "/tmp/fluxcast/stream.m3u8",
+        "-o", monitor.name,
     ]
 
-    # ── Process 2: ffmpeg (reads wf-recorder stdout via stdin pipe + adds audio) ─
-    ffmpeg_cmd = [
-        FFMPEG_PATH, "-y",
-        "-loglevel", "warning",    # show warnings/errors while we stabilize Samsung playback
-
-        # Keep startup quick without starving ffmpeg of H.264 stream metadata.
-        "-fflags", "+genpts",
-        "-probesize", "65536",
-        "-analyzeduration", "100000",
-
-        # Video: read from wf-recorder via stdin pipe
-        "-thread_queue_size", "1024",
-        "-f", "nut",
-        "-i", "pipe:0",
-
-        # Audio from PulseAudio (ffmpeg wakes up suspended sinks)
-        "-thread_queue_size", "1024",
-        "-f", "pulse",
-        "-i", audio_monitor,
-    ]
-
-    ffmpeg_cmd += [
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-    ]
-
-    if reencode_video:
-        ffmpeg_cmd += [
-            "-vf", ",".join(vf_filters),
-
-            # Only re-encode when scaling is requested. The normal path copies
-            # wf-recorder's H.264 to avoid CPU spikes during browser playback.
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-profile:v", "main",
-            "-level:v", "4.0",
-            "-pix_fmt", "yuv420p",
-            "-r", str(fps),
-            "-g", str(gop),
-            "-keyint_min", str(gop),
-            "-sc_threshold", "0",
-            "-bf", "0",
-            "-b:v", bitrate,
-            "-maxrate", bitrate,
-            "-bufsize", _double_bitrate(bitrate),
-            "-x264-params", "repeat-headers=1:aud=1",
-            "-force_key_frames", f"expr:gte(t,n_forced*{hls_time})",
-        ]
-    else:
-        ffmpeg_cmd += ["-c:v", "copy"]
-
-    ffmpeg_cmd += [
-        "-c:a", "aac",
-        "-profile:a", "aac_low",
-        "-b:a", "128k",
-        "-ac", "2",
-        "-ar", "48000",
-
-        # Samsung DLNA is much happier with HLS files than a raw infinite pipe.
-        "-f", "hls",
-        "-hls_time", hls_time,
-        "-hls_init_time", hls_time,
-        "-hls_list_size", "3",
-        "-hls_delete_threshold", "20",
-        "-hls_allow_cache", "0",
-        "-hls_segment_type", "mpegts",
-        "-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file",
-        "-hls_start_number_source", "generic",
-        "-start_number", "0",
-        "-hls_segment_filename", f"{HLS_DIR}/stream%05d.ts",
-        f"{HLS_DIR}/stream.m3u8",
-    ]
-
-    print(f"[FluxCast] Capturing screen : {monitor.name} via Wayland ({src_res})")
-    print(f"[FluxCast] Capturing audio  : {audio_monitor}")
-    print(f"[FluxCast] Video pipeline    : {'re-encode' if reencode_video else 'copy'}")
-    if vbv_maxrate and vbv_bufsize:
-        print(f"[FluxCast] Video bitrate cap : {vbv_maxrate}k max / {vbv_bufsize}k buffer")
-    print(f"[FluxCast] HLS segment time  : {hls_time}s")
+    print(f"[FluxCast] Capturing Wayland monitor : {monitor.name} ({src_res})")
     if out_res != src_res:
-        print(f"[FluxCast] Scaling output to: {out_res}")
+        print(f"[FluxCast] Scaling output to : {out_res}")
+
+    hls_dir = "/tmp/fluxcast"
+    if os.path.exists(hls_dir):
+        shutil.rmtree(hls_dir)
+    os.makedirs(hls_dir, exist_ok=True)
 
     try:
-        # wf-recorder writes NUT to its stdout
-        wf_proc = subprocess.Popen(
-            wf_cmd,
-            stdout=subprocess.PIPE,
-            stderr=None,   # temporarily print stderr directly for diagnostics
+        process = subprocess.Popen(
+            cmd,
+            stderr=subprocess.DEVNULL,
         )
-        # ffmpeg reads wf-recorder's stdout via its own stdin
-        ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=wf_proc.stdout,  # direct kernel pipe — no FIFO needed
-            stdout=subprocess.DEVNULL,
-            stderr=None,
-        )
-        # Close parent's reference to wf_proc.stdout so ffmpeg gets EOF on wf exit
-        wf_proc.stdout.close()
     except FileNotFoundError as e:
         print(f"[FluxCast] ERROR: Required executable not found: {e}")
         sys.exit(1)
 
-    time.sleep(2.0)
-    if wf_proc.poll() is not None:
-        print("[FluxCast] ERROR: wf-recorder exited. See stderr above.")
-        sys.exit(1)
-    if ffmpeg_proc.poll() is not None:
-        print("[FluxCast] ERROR: ffmpeg exited. See stderr above.")
+    time.sleep(1.5)
+    if process.poll() is not None:
+        print(f"[FluxCast] ERROR: wf-recorder exited immediately. Check monitor name.")
         sys.exit(1)
 
-    return [wf_proc, ffmpeg_proc]
+    return process
 
 
-def stop_capture(processes: "Optional[List[subprocess.Popen[bytes]]]") -> None:
-    if not processes:
+def stop_capture(process: "Optional[subprocess.Popen[bytes]]") -> None:
+    if process is None:
         return
-    for proc in processes:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
