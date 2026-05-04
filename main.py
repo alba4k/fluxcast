@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wfd-media-pipeline", default="auto",
                         choices=["auto", "ffmpeg", "gst"],
                         dest="wfd_media_pipeline",
-                        help="For --protocol wfd, RTP media sender: auto (stable ffmpeg), ffmpeg, or gst")
+                        help="For --protocol wfd, RTP media sender: auto (gst for test-pattern, ffmpeg for desktop), ffmpeg, or gst")
     parser.add_argument("--wfd-no-audio", action="store_true", dest="wfd_no_audio",
                         help="For --protocol wfd, stream video only")
     parser.add_argument("--wfd-audio-device", default=None, dest="wfd_audio_device",

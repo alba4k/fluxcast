@@ -459,9 +459,10 @@ class WFDMediaPipeline:
         requested_pipeline = self.config.media_pipeline
         pipeline = requested_pipeline
         if pipeline == "auto":
-            # Prefer ffmpeg for stability across Samsung WFD receivers.
-            # GStreamer sender remains available as an explicit opt-in.
-            pipeline = "ffmpeg"
+            # For WFD test-pattern smoke runs, Samsung receivers are usually
+            # more tolerant of the explicit GStreamer mpegtsmux/rtpmp2t path.
+            # Keep ffmpeg as the default sender for desktop capture.
+            pipeline = "gst" if self.config.test_pattern and _gst_wfd_sender_available() else "ffmpeg"
 
         if pipeline == "gst":
             if not self.config.test_pattern:
