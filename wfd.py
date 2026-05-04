@@ -515,6 +515,12 @@ class WFDMediaPipeline:
             "-muxdelay", "0",
             "-muxpreload", "0",
             "-flush_packets", "1",
+            # WFD receivers (notably Samsung) are sensitive to MPEG-TS layout.
+            # Keep PMT/video/audio PID values aligned with the working gst path:
+            # PMT PID 0x1000, video PID 0x1011, audio PID 0x1100.
+            "-mpegts_pmt_start_pid", "4096",
+            "-mpegts_start_pid", "4113",
+            "-streamid", "0:4113",
             "-mpegts_flags", "resend_headers+pat_pmt_at_frames",
             "-pat_period", "0.1",
             "-pcr_period", "20",
@@ -571,6 +577,7 @@ class WFDMediaPipeline:
                 "-b:a", "128k",
                 "-ac", "2",
                 "-ar", "48000",
+                "-streamid", "1:4352",
             ]
 
         cmd += self._common_output_args()
@@ -736,6 +743,7 @@ class WFDMediaPipeline:
                 "-b:a", "128k",
                 "-ac", "2",
                 "-ar", "48000",
+                "-streamid", "1:4352",
             ]
 
         ffmpeg_cmd += self._common_output_args()
