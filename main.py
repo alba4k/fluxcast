@@ -4,9 +4,9 @@ FluxCast entry point
 Usage:
     python main.py [OPTIONS]
 
-    --protocol dlna|cast|wfd dlna = UPnP native screening (default, reliable fallback)
+    --protocol dlna|cast|wfd wfd = Miracast/Wi-Fi Display (default)
+                             dlna = UPnP native screening fallback
                              cast = pychromecast (needs Chromecast built-in)
-                             wfd = experimental Miracast/Wi-Fi Display path
     --host HOST              LAN IP to advertise to the TV (default: auto-detect)
     --port PORT              HTTP server port (default: 8080)
     --output-res WxH         Scale output (e.g. 1920x1080); default: native
@@ -22,6 +22,7 @@ Usage:
     --wfd-peer PEER          WFD peer selector for --protocol wfd (index, MAC, name)
     --wfd-dry-run            Print WFD connection D-Bus call without activating it
     --wfd-test-pattern       Stream a generated test pattern instead of the desktop
+    --wfd-latency-log PATH   Write WFD latency/session events to JSONL log file
     --tv-ip IP               (For cast protocol only: direct IP connection)
 """
 
@@ -51,11 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FluxCast — stream your Arch Linux desktop to a Smart TV"
     )
-    parser.add_argument("--protocol", default="dlna",
+    parser.add_argument("--protocol", default="wfd",
                         choices=["dlna", "cast", "wfd"],
-                        help="Connection protocol: dlna (UPnP, default) "
-                             "cast (pychromecast / Chromecast built-in), "
-                             "or wfd (experimental Miracast/Wi-Fi Display)")
+                        help="Connection protocol: wfd (Miracast, default), "
+                             "dlna (UPnP fallback), or cast (Chromecast built-in)")
     parser.add_argument("--tv-ip", default=None, dest="tv_ip",
                         help="TV IP address (only applicable for --protocol cast)")
     parser.add_argument("--host", default=None,
@@ -87,12 +87,14 @@ def parse_args() -> argparse.Namespace:
                         help="Print WFD connection D-Bus call without activating it")
     parser.add_argument("--wfd-test-pattern", action="store_true", dest="wfd_test_pattern",
                         help="For --protocol wfd, stream generated test video instead of the desktop")
-    parser.add_argument("--wfd-test-audio", action="store_true", dest="wfd_test_audio",
-                        help="Legacy flag for --wfd-test-pattern (AAC test audio is enabled by default)")
     parser.add_argument("--wfd-media-pipeline", default="auto",
                         choices=["auto", "ffmpeg", "gst"],
                         dest="wfd_media_pipeline",
                         help="For --protocol wfd, RTP media sender: auto (gst for test-pattern, ffmpeg for desktop), ffmpeg, or gst")
+    parser.add_argument("--wfd-latency-log", nargs="?", const="/tmp/fluxcast-wfd-latency.jsonl",
+                        default=None, dest="wfd_latency_log",
+                        help="For --protocol wfd, JSONL file path for latency/session logging "
+                             "(default: /tmp/fluxcast-wfd-latency.jsonl)")
     parser.add_argument("--wfd-no-audio", action="store_true", dest="wfd_no_audio",
                         help="For --protocol wfd, stream video only")
     parser.add_argument("--wfd-audio-device", default=None, dest="wfd_audio_device",

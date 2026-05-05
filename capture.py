@@ -128,7 +128,7 @@ def start_capture(
         "-y",
         "-D",
         "-r", str(fps),
-        "-a", # capture system audio
+        "-a",
         "-C", "aac",
         "-P", "b:a=128k",
         "-c", "libx264",

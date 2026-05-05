@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import threading
 import time
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -15,7 +17,7 @@ WFD_RTSP_PORT = 7236
 WFD_SOURCE_IE_TEMPLATE = bytes.fromhex("00000600901c4400c8")
 
 # WFD CEA resolution bitmask. The current backend intentionally negotiates
-# only the common HD modes that Samsung TVs usually accept reliably.
+# only the !common! HD modes that Samsung TVs usually accept reliably.
 WFD_CEA_720P30 = 0x00000020   # bit 5: 1280x720p30, mandatory HD mode
 WFD_CEA_720P60 = 0x00000040   # bit 6: 1280x720p60
 WFD_CEA_1080P30 = 0x00000080  # bit 7: 1920x1080p30
@@ -82,6 +84,7 @@ class WFDMediaConfig:
     test_pattern: bool = False
     source_port: int = 19002
     media_pipeline: str = "auto"
+    latency_log_path: Optional[str] = None
 
 
 @dataclass
@@ -181,7 +184,6 @@ def _gst_pick_aac_encoder() -> tuple[str, list[str]]:
     Pick a broadly available AAC encoder and a compatible raw-audio caps filter.
     """
     if _gst_has_element("fdkaacenc"):
-        # fdkaacenc is strict on sample format on many distros.
         return "fdkaacenc", ["audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"]
     if _gst_has_element("avenc_aac"):
         return "avenc_aac", ["audio/x-raw,rate=48000,channels=2"]
@@ -220,6 +222,40 @@ def _bitrate_to_kbits(value: str) -> int:
     else:
         amount /= 1_000
     return max(1, round(amount))
+
+
+def _kbits_to_bitrate_text(value_kbits: int) -> str:
+    if value_kbits % 1000 == 0:
+        return f"{value_kbits // 1000}M"
+    return f"{value_kbits}k"
+
+
+def _quality_floor_kbits(width: int, height: int, fps: int) -> int:
+    """
+    Conservative quality floors for desktop readability at low latency.
+    """
+    pixels = width * height
+    if pixels <= 1280 * 720:
+        return 5000 if fps <= 30 else 7000
+    if pixels <= 1920 * 1080:
+        return 8000 if fps <= 30 else 12000
+    return 12000 if fps <= 30 else 16000
+
+
+def _append_latency_log(path: Optional[str], event: str, **fields: object) -> None:
+    if not path:
+        return
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "mono": round(time.monotonic(), 6),
+        "event": event,
+        **fields,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except OSError:
+        pass
 
 
 def _parse_sink_video_format(value: str) -> Optional[WFDVideoFormat]:
@@ -446,13 +482,11 @@ class WFDMediaPipeline:
         self.processes: list[subprocess.Popen[bytes]] = []
         self.tx_interface: Optional[str] = None
         self.tx_baseline: Optional[int] = None
-        self.started_at = 0.0
 
     def start(self) -> None:
         if self.processes:
             return
 
-        self.started_at = time.monotonic()
         self.tx_interface = _interface_for_ip(self.local_ip)
         self.tx_baseline = _netdev_tx_bytes(self.tx_interface)
 
@@ -470,7 +504,6 @@ class WFDMediaPipeline:
             try:
                 self._start_gst_test_pattern()
             except WFDNotReady:
-                # In auto mode, transparently fall back to ffmpeg if gst startup fails.
                 if requested_pipeline == "auto":
                     print("[FluxCast WFD Media] GStreamer sender failed to start; falling back to ffmpeg.")
                     self._start_test_pattern()
@@ -507,16 +540,13 @@ class WFDMediaPipeline:
     def _common_output_args(self) -> list[str]:
         """
         Low-latency RTP/MPEG-TS output args.
-
-        ffmpeg accepts the MPEG-TS private options here even when the outer
-        muxer is rtp_mpegts, which keeps this compatible with older builds.
         """
         return [
             "-muxdelay", "0",
             "-muxpreload", "0",
             "-flush_packets", "1",
             # WFD receivers (notably Samsung) are sensitive to MPEG-TS layout.
-            # Keep PMT/video/audio PID values aligned with the working gst path:
+            # Keep PMT/video/audio PID values aligned with the working gst path!!!
             # PMT PID 0x1000, video PID 0x1011, audio PID 0x1100.
             "-mpegts_pmt_start_pid", "4096",
             "-mpegts_start_pid", "4113",
@@ -659,7 +689,6 @@ class WFDMediaPipeline:
             f"[FluxCast WFD Media] Starting GStreamer test RTP stream to "
             f"{self.tv_ip}:{self.sink_rtp_port} from {self.local_ip}:{self.config.source_port}"
         )
-        # Print command for debugging
         print(f"[FluxCast WFD Media] GST cmd: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)  # stderr/stdout visible for debugging
         time.sleep(0.8)
@@ -680,6 +709,16 @@ class WFDMediaPipeline:
         out_res = self.config.output_resolution or src_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
         gop = max(1, self.config.fps)
+        parsed_out = _parse_resolution(out_res) or (monitor.width, monitor.height)
+        requested_kbits = _bitrate_to_kbits(self.config.bitrate)
+        floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
+        effective_kbits = max(requested_kbits, floor_kbits)
+        effective_bitrate = _kbits_to_bitrate_text(effective_kbits)
+        if effective_kbits > requested_kbits:
+            print(
+                "[FluxCast WFD Media] Raising bitrate for desktop clarity: "
+                f"{self.config.bitrate} -> {effective_bitrate}"
+            )
 
         wf_cmd = [
             "wf-recorder",
@@ -720,7 +759,7 @@ class WFDMediaPipeline:
 
         ffmpeg_cmd += [
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast",
             "-tune", "zerolatency",
             "-profile:v", "baseline",
             "-level:v", _h264_level_for_mode(self.config),
@@ -730,9 +769,9 @@ class WFDMediaPipeline:
             "-keyint_min", str(gop),
             "-sc_threshold", "0",
             "-bf", "0",
-            "-b:v", self.config.bitrate,
-            "-maxrate", self.config.bitrate,
-            "-bufsize", _double_bitrate(self.config.bitrate),
+            "-b:v", effective_bitrate,
+            "-maxrate", effective_bitrate,
+            "-bufsize", _double_bitrate(effective_bitrate),
             "-x264-params", "repeat-headers=1:aud=1",
         ]
 
@@ -853,12 +892,21 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         self.sink_rtcp_port: int = 0
         self.source_rtp_port = self.media_config.source_port
         self.sink_video_format: Optional[WFDVideoFormat] = None
-        self.sink_audio_codecs = ""
         self.negotiated_no_audio = False
         self.m3_sent = False
         self.media: Optional[WFDMediaPipeline] = None
+        self.connected_at = time.monotonic()
+        self.play_accepted_at: Optional[float] = None
+        self.setup_ms: Optional[float] = None
+        self.first_tx_reported = False
 
         print(f"[FluxCast WFD RTSP] TV connected from {peer}; local={self.local_ip}")
+        _append_latency_log(
+            self.media_config.latency_log_path,
+            "rtsp_connected",
+            peer=peer,
+            local_ip=self.local_ip,
+        )
         try:
             self._send_m1_options()
             while True:
@@ -1033,7 +1081,6 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 params.get("wfd_video_formats", "")
             )
             audio = params.get("wfd_audio_codecs", "")
-            self.sink_audio_codecs = audio
             if (
                 audio
                 and not self.media_config.no_audio
@@ -1178,6 +1225,14 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 f"[FluxCast WFD RTSP] Starting media as {mode.name}; "
                 f"RTP source port {self.source_rtp_port}"
             )
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "media_starting",
+                mode=mode.name,
+                tv_ip=self.client_address[0],
+                sink_rtp_port=self.sink_rtp_port,
+                source_rtp_port=self.source_rtp_port,
+            )
             self.media = WFDMediaPipeline(
                 effective_config,
                 tv_ip=self.client_address[0],
@@ -1186,6 +1241,13 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             )
             self.media.start()
             print("[FluxCast WFD RTSP] PLAY accepted; media stream started.")
+            self.play_accepted_at = time.monotonic()
+            self.setup_ms = round((self.play_accepted_at - self.connected_at) * 1000.0, 1)
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "play_accepted",
+                setup_ms=self.setup_ms,
+            )
             self._schedule_probe(0.7)
 
     def _schedule_probe(self, delay: float) -> None:
@@ -1204,9 +1266,45 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             states.append(f"pid={proc.pid}:{status}")
 
         if states and all(proc.poll() is None for proc in media.processes):
+            current = _netdev_tx_bytes(media.tx_interface)
+            delta = None
+            if media.tx_baseline is not None and current is not None:
+                delta = max(0, current - media.tx_baseline)
+            if (
+                not self.first_tx_reported
+                and delta is not None
+                and delta > 0
+                and self.play_accepted_at is not None
+            ):
+                self.first_tx_reported = True
+                sender_startup_ms = round((time.monotonic() - self.play_accepted_at) * 1000.0, 1)
+                print(
+                    f"[FluxCast WFD Media] Latency probe: first RTP bytes after PLAY in "
+                    f"{sender_startup_ms} ms"
+                )
+                sender_path_latency_ms = None
+                if self.setup_ms is not None:
+                    sender_path_latency_ms = round(self.setup_ms + sender_startup_ms, 1)
+                    print(
+                        "[FluxCast WFD Media] Latency probe: sender-path latency "
+                        f"(RTSP connect -> first RTP) {sender_path_latency_ms} ms"
+                    )
+                _append_latency_log(
+                    self.media_config.latency_log_path,
+                    "latency_probe",
+                    sender_startup_ms=sender_startup_ms,
+                    setup_ms=self.setup_ms,
+                    sender_path_latency_ms=sender_path_latency_ms,
+                )
             print(
                 f"[FluxCast WFD Media] Sender health: "
                 f"{', '.join(states)}; {media.tx_summary()}"
+            )
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "sender_health",
+                processes=states,
+                tx_summary=media.tx_summary(),
             )
             self._schedule_probe(5.0)
             return
@@ -1568,7 +1666,7 @@ def _connect_peer(
         raise WFDNotReady("NetworkManager peer object path is required for P2P connection.")
 
     settings = _connection_settings(peer, rtsp_port)
-    # Do not use bind-activation here: the gdbus CLI process exits right after
+    # !!!Do not use bind-activation here!!!: the gdbus CLI process exits right after
     # the method call, and NetworkManager would tear the P2P link down with it.
     options = "{'persist': <'volatile'>}"
     args = [
@@ -1630,10 +1728,11 @@ def _select_peer(peers: list[WFDPeer], selector: Optional[str]) -> WFDPeer:
     if not peers:
         raise WFDNotReady("No Wi-Fi Direct peers found. Put the TV into Screen Share/Wireless Display mode.")
     if selector is None:
-        if len(peers) == 1:
-            return peers[0]
         print_scan(peers)
-        raw = input("Select WFD peer [0]: ").strip()
+        try:
+            raw = input("Select WFD peer [0]: ").strip()
+        except EOFError:
+            raw = ""
         selector = raw or "0"
 
     if selector.isdigit():
@@ -1678,9 +1777,6 @@ def _parse_peer_name(details: str) -> str:
 
 def active_scan(interface: Optional[str] = None, timeout: int = 8) -> list[WFDPeer]:
     """Run an active Wi-Fi Direct peer scan.
-
-    This does not connect to anything, but it may briefly put the Wi-Fi adapter
-    into P2P discovery/listen activity.
     """
     try:
         return _nm_scan(interface=interface, timeout=timeout)
@@ -1797,10 +1893,7 @@ def start_experimental_backend(args) -> None:
         if no_audio:
             print("[FluxCast WFD] Test pattern smoke mode is video-only (--wfd-no-audio).")
         else:
-            print(
-                "[FluxCast WFD] Test pattern smoke mode includes AAC audio by default. "
-                "Use --wfd-no-audio to isolate a video-only path."
-            )
+            print("[FluxCast WFD] Test pattern smoke mode includes AAC audio.")
 
     media_config = WFDMediaConfig(
         monitor=monitor,
@@ -1812,7 +1905,10 @@ def start_experimental_backend(args) -> None:
         test_pattern=getattr(args, "wfd_test_pattern", False),
         source_port=getattr(args, "wfd_rtp_source_port", 19002),
         media_pipeline=getattr(args, "wfd_media_pipeline", "auto"),
+        latency_log_path=getattr(args, "wfd_latency_log", None),
     )
+    if media_config.latency_log_path:
+        print(f"[FluxCast WFD] Latency log file: {media_config.latency_log_path}")
 
     rtsp = WFDRTSPServer(
         media_config=media_config,

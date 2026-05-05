@@ -1,0 +1,209 @@
+# FluxCast Documentation
+
+Complete reference for modes, flags, and practical command combinations.
+
+## Quick Start
+
+```bash
+python3 main.py
+```
+
+By default, FluxCast starts in `wfd` mode (Miracast/Wi-Fi Display).
+
+## Modes
+
+- `wfd`: low-latency path via Wi-Fi Direct + RTSP/RTP.
+- `dlna`: fallback path via HTTP + DLNA/UPnP TV player.
+- `cast`: Chromecast path via `pychromecast`.
+
+Mode selection:
+
+```bash
+python3 main.py --protocol wfd
+python3 main.py --protocol dlna
+python3 main.py --protocol cast
+```
+
+## Full CLI Flags
+
+### General Flags
+
+- `--protocol dlna|cast|wfd`
+- `--host HOST`
+- `--port PORT`
+- `--output-res WxH`
+- `--fps N`
+- `--bitrate Xm`
+- `--discover-timeout N`
+- `--transport progressive-ts|hls|live-ts`
+- `--doctor`
+- `--doctor-json`
+- `--tv-ip IP` (for `cast` only)
+
+### WFD Flags
+
+- `--wfd-scan`
+- `--wfd-peer PEER`
+- `--wfd-dry-run`
+- `--wfd-test-pattern`
+- `--wfd-media-pipeline auto|ffmpeg|gst`
+- `--wfd-latency-log [PATH]`
+- `--wfd-no-audio`
+- `--wfd-audio-device DEVICE`
+- `--wfd-rtsp-port PORT`
+- `--wfd-rtp-source-port PORT`
+- `--wfd-interface IFACE`
+- `--wfd-timeout SEC`
+
+## Flag Details
+
+### Core Flags
+
+- `--protocol`
+  - Default: `wfd`.
+  - `dlna` and `cast` are fallback/alternative paths.
+- `--output-res`
+  - Example: `1280x720`, `1920x1080`.
+  - In `wfd`, affects negotiated media mode and scaling.
+- `--fps`
+  - Recommended for stability: `30`.
+- `--bitrate`
+  - Formats: `3000k`, `3M`, `5M`.
+  - Desktop WFD has a quality floor (the code may automatically raise a too-low bitrate).
+
+### DLNA/Cast
+
+- `--host`, `--port`
+  - HTTP server address and port for DLNA/Cast streams.
+- `--discover-timeout`
+  - Discovery timeout for DLNA/Cast.
+- `--transport`
+  - `progressive-ts` (default), `hls`, `live-ts`.
+- `--tv-ip`
+  - For `cast`: direct IP connection without discovery.
+
+### Diagnostics
+
+- `--doctor`
+  - Human-readable capability report.
+- `--doctor-json`
+  - Same report in JSON for automation.
+
+### WFD Discovery/Connect
+
+- `--wfd-scan`
+  - Scan only, no connection attempt.
+- `--wfd-peer`
+  - Accepts index, MAC, or device-name substring.
+  - If omitted, FluxCast prints peers and asks for interactive selection.
+- `--wfd-dry-run`
+  - Prints the D-Bus connection call without activating a session.
+- `--wfd-interface`
+  - Explicit interface for scan path.
+- `--wfd-timeout`
+  - Active peer discovery timeout.
+
+### WFD Media
+
+- `--wfd-test-pattern`
+  - Uses a generated test video/audio stream instead of desktop capture.
+- `--wfd-media-pipeline`
+  - `auto`: `gst` for test-pattern, `ffmpeg` for desktop.
+  - `ffmpeg`: force ffmpeg sender.
+  - `gst`: force GStreamer sender (currently mainly for test-pattern).
+- `--wfd-no-audio`
+  - Video-only mode.
+- `--wfd-audio-device`
+  - Explicit Pulse/PipeWire monitor source.
+- `--wfd-rtsp-port`
+  - RTSP port in WFD source IE (usually does not need changes).
+- `--wfd-rtp-source-port`
+  - Local RTP source port.
+
+### WFD Latency Log
+
+- `--wfd-latency-log`
+  - Without an argument, writes to `/tmp/fluxcast-wfd-latency.jsonl`.
+  - With an argument, writes to the specified path.
+  - Format: one JSON object per line (JSONL).
+
+Examples:
+
+```bash
+python3 main.py --wfd-latency-log
+python3 main.py --wfd-latency-log /tmp/my-latency.jsonl
+```
+
+## Latency Log Events
+
+- `rtsp_connected`
+  - Source accepted incoming TCP/RTSP connection from sink.
+- `media_starting`
+  - Sender process startup began.
+- `play_accepted`
+  - Includes `setup_ms`: time from `rtsp_connected` to accepted `PLAY`.
+- `latency_probe`
+  - Includes `sender_startup_ms`: from `PLAY accepted` to first transmitted RTP bytes.
+  - Includes `sender_path_latency_ms`: `setup_ms + sender_startup_ms`.
+  - This is an accurate sender-path latency metric inside FluxCast (excludes TV decode/render delay).
+- `sender_health`
+  - Periodic telemetry of process health and transmitted-byte counter.
+
+## Practical Command Combinations
+
+### 1) Default WFD run (interactive)
+
+```bash
+python3 main.py
+```
+
+### 2) WFD + telemetry latency log
+
+```bash
+python3 main.py --wfd-latency-log
+```
+
+### 3) WFD test-pattern smoke
+
+```bash
+python3 main.py --protocol wfd --wfd-test-pattern --output-res 1280x720 --bitrate 3M
+```
+
+### 4) WFD test-pattern video-only
+
+```bash
+python3 main.py --protocol wfd --wfd-test-pattern --wfd-no-audio --output-res 1280x720 --bitrate 3M
+```
+
+### 5) WFD desktop stable baseline
+
+```bash
+python3 main.py --protocol wfd --output-res 1280x720 --fps 30 --bitrate 3M --wfd-media-pipeline ffmpeg
+```
+
+### 6) WFD peer scan only
+
+```bash
+python3 main.py --wfd-scan
+```
+
+### 7) DLNA fallback
+
+```bash
+python3 main.py --protocol dlna
+```
+
+### 8) Cast fallback
+
+```bash
+python3 main.py --protocol cast
+python3 main.py --protocol cast --tv-ip 192.168.1.50
+```
+
+## What "Healthy" Looks Like In Logs
+
+- `sender_health` approximately every 5 seconds.
+- `processes: ... running`.
+- `tx_summary` keeps increasing over time.
+
+If these conditions hold, RTP transmission is stable. Visual quality and smoothness then mostly depend on bitrate/fps/preset and Wi-Fi radio conditions.
