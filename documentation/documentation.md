@@ -12,15 +12,15 @@ By default, FluxCast starts in `wfd` mode (Miracast/Wi-Fi Display).
 
 ## Modes
 
-- `wfd`: low-latency path via Wi-Fi Direct + RTSP/RTP.
-- `dlna`: fallback path via HTTP + DLNA/UPnP TV player.
-- `cast`: Chromecast path via `pychromecast`.
+- `wfd`: **Primary recommended path** - low-latency via Wi-Fi Direct + RTSP/RTP. Works excellently on Samsung TVs.
+- `dlna`: **Legacy fallback path** - via HTTP + DLNA/UPnP TV player. Use `--transport hls` for better stability on Samsung TVs.
+- `cast`: **Experimental/NOT TESTED** - Chromecast via `pychromecast`. Not supported on many Samsung TV models.
 
 Mode selection:
 
 ```bash
 python3 main.py --protocol wfd
-python3 main.py --protocol dlna
+python3 main.py --protocol dlna --transport hls
 python3 main.py --protocol cast
 ```
 
@@ -78,9 +78,11 @@ python3 main.py --protocol cast
 - `--discover-timeout`
   - Discovery timeout for DLNA/Cast.
 - `--transport`
-  - `progressive-ts` (default), `hls`, `live-ts`.
+  - `hls`: **Recommended for Samsung TVs** - more stable HLS streaming
+  - `progressive-ts`: May cause freezing on some Samsung TV models
+  - `live-ts`: Experimental live MPEG-TS transport
 - `--tv-ip`
-  - For `cast`: direct IP connection without discovery.
+  - For `cast`: direct IP connection without discovery (may not work on Samsung TVs).
 
 ### Diagnostics
 
@@ -112,7 +114,8 @@ python3 main.py --protocol cast
   - `ffmpeg`: force ffmpeg sender.
   - `gst`: force GStreamer sender (currently mainly for test-pattern).
 - `--wfd-no-audio`
-  - Video-only mode.
+  - **Video-only mode** - May cause immediate disconnects on Samsung TVs during WFD negotiation.
+  - Use primarily for diagnostic/testing purposes.
 - `--wfd-audio-device`
   - Explicit Pulse/PipeWire monitor source.
 - `--wfd-rtsp-port`
@@ -187,13 +190,13 @@ python3 main.py --protocol wfd --output-res 1280x720 --fps 30 --bitrate 3M --wfd
 python3 main.py --wfd-scan
 ```
 
-### 7) DLNA fallback
+### 7) DLNA fallback (recommended for Samsung TVs)
 
 ```bash
-python3 main.py --protocol dlna
+python3 main.py --protocol dlna --transport hls
 ```
 
-### 8) Cast fallback
+### 8) Cast fallback (experimental, may not work on Samsung TVs)
 
 ```bash
 python3 main.py --protocol cast

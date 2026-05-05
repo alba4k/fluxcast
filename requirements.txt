@@ -1,1 +1,2 @@
-pychromecast
+upnpclient>=1.0.3
+pychromecast>=14.0.5
