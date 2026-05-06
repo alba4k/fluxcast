@@ -292,7 +292,7 @@ def run_diagnostics() -> DiagnosticReport:
     by_name = {check.name: check for check in checks}
     network_hw_ok = (
         by_name.get("NetworkManager", Check("", STATUS_SKIP, "")).status == STATUS_OK
-        and by_name.get("iw P2P", Check("", STATUS_SKIP, "")).status == STATUS_OK
+        or by_name.get("iw P2P", Check("", STATUS_SKIP, "")).status == STATUS_OK
     )
     media_ok = (
         by_name.get("ffmpeg encoders", Check("", STATUS_SKIP, "")).status == STATUS_OK
