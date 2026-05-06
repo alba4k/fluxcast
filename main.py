@@ -71,6 +71,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discover-timeout", type=int, default=5,
                         dest="discover_timeout",
                         help="Discovery timeout in seconds (default: 5)")
+    parser.add_argument("--capture-backend", default="auto", dest="capture_backend",
+                        choices=["auto", "wf-recorder", "x11grab"],
+                        help="Desktop capture backend for dlna/cast: auto (default), wf-recorder, or x11grab")
     parser.add_argument("--transport", default="progressive-ts",
                         choices=["progressive-ts", "hls", "live-ts"],
                         help="DLNA stream transport: progressive-ts for low latency "
@@ -91,6 +94,9 @@ def parse_args() -> argparse.Namespace:
                         choices=["auto", "ffmpeg", "gst"],
                         dest="wfd_media_pipeline",
                         help="For --protocol wfd, RTP media sender: auto (gst for test-pattern, ffmpeg for desktop), ffmpeg, or gst")
+    parser.add_argument("--wfd-capture-backend", default="auto", dest="wfd_capture_backend",
+                        choices=["auto", "wf-recorder", "x11grab"],
+                        help="Desktop capture backend for --protocol wfd: auto (default), wf-recorder, or x11grab")
     parser.add_argument("--wfd-latency-log", nargs="?", const="/tmp/fluxcast-wfd-latency.jsonl",
                         default=None, dest="wfd_latency_log",
                         help="For --protocol wfd, JSONL file path for latency/session logging "
@@ -243,6 +249,7 @@ def main() -> None:
         fps=args.fps,
         bitrate=args.bitrate,
         output_resolution=args.output_res,
+        backend=args.capture_backend,
     )
     print("[FluxCast] Screen capture started.")
 

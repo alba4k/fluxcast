@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import json
+import os
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -85,6 +86,7 @@ class WFDMediaConfig:
     source_port: int = 19002
     media_pipeline: str = "auto"
     latency_log_path: Optional[str] = None
+    capture_backend: str = "auto"
 
 
 @dataclass
@@ -153,6 +155,34 @@ def _detect_audio_monitor() -> str:
     except Exception:
         pass
     return "default"
+
+
+def _is_hyprland_session() -> bool:
+    desktop = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+    session = (os.environ.get("XDG_SESSION_DESKTOP") or "").lower()
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) or "hyprland" in desktop or "hyprland" in session
+
+
+def _is_wayland_session() -> bool:
+    session_type = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+    return bool(os.environ.get("WAYLAND_DISPLAY")) or session_type == "wayland"
+
+
+def _is_x11_session() -> bool:
+    session_type = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+    return bool(os.environ.get("DISPLAY")) and (session_type == "x11" or not _is_wayland_session())
+
+
+def _wfd_capture_backend_order(config: WFDMediaConfig) -> list[str]:
+    if config.capture_backend != "auto":
+        return [config.capture_backend]
+    if _is_hyprland_session():
+        return ["wf-recorder", "x11grab"]
+    if _is_x11_session():
+        return ["x11grab", "wf-recorder"]
+    if _is_wayland_session():
+        return ["wf-recorder", "x11grab"]
+    return ["x11grab", "wf-recorder"]
 
 
 def _gst_has_element(name: str) -> bool:
@@ -697,12 +727,29 @@ class WFDMediaPipeline:
         self.processes = [proc]
 
     def _start_desktop(self) -> None:
-        if not shutil.which("wf-recorder"):
-            raise WFDNotReady("wf-recorder is required for WFD desktop streaming.")
         if not shutil.which("ffmpeg"):
             raise WFDNotReady("ffmpeg is required for WFD desktop streaming.")
         if self.config.monitor is None:
             raise WFDNotReady("WFD desktop streaming needs a selected monitor.")
+
+        backends = _wfd_capture_backend_order(self.config)
+        errors: list[str] = []
+        for idx, backend in enumerate(backends):
+            try:
+                if backend == "x11grab":
+                    self._start_desktop_x11grab()
+                else:
+                    self._start_desktop_wf_recorder()
+                return
+            except WFDNotReady as exc:
+                errors.append(f"{backend}: {exc}")
+                if idx < len(backends) - 1:
+                    print(f"[FluxCast WFD Media] Backend {backend} failed, trying fallback...")
+        raise WFDNotReady("; ".join(errors) if errors else "No usable capture backend")
+
+    def _start_desktop_wf_recorder(self) -> None:
+        if not shutil.which("wf-recorder"):
+            raise WFDNotReady("wf-recorder is required for WFD desktop streaming.")
 
         monitor = self.config.monitor
         src_res = f"{monitor.width}x{monitor.height}"
@@ -814,6 +861,99 @@ class WFDMediaPipeline:
             raise WFDNotReady("ffmpeg exited immediately during WFD streaming.")
 
         self.processes = [wf_proc, ffmpeg_proc]
+
+    def _start_desktop_x11grab(self) -> None:
+        monitor = self.config.monitor
+        src_res = f"{monitor.width}x{monitor.height}"
+        out_res = self.config.output_resolution or src_res
+        audio_monitor = self.config.audio_device or _detect_audio_monitor()
+        gop = max(1, self.config.fps)
+        parsed_out = _parse_resolution(out_res) or (monitor.width, monitor.height)
+        requested_kbits = _bitrate_to_kbits(self.config.bitrate)
+        floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
+        effective_kbits = max(requested_kbits, floor_kbits)
+        effective_bitrate = _kbits_to_bitrate_text(effective_kbits)
+        if effective_kbits > requested_kbits:
+            print(
+                "[FluxCast WFD Media] Raising bitrate for desktop clarity: "
+                f"{self.config.bitrate} -> {effective_bitrate}"
+            )
+
+        display = os.environ.get("DISPLAY", monitor.display or ":0")
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-loglevel", "warning",
+            "-thread_queue_size", "1024",
+            "-f", "x11grab",
+            "-framerate", str(self.config.fps),
+            "-video_size", src_res,
+            "-i", f"{display}+{monitor.x},{monitor.y}",
+        ]
+
+        if not self.config.no_audio:
+            ffmpeg_cmd += [
+                "-thread_queue_size", "1024",
+                "-f", "pulse",
+                "-i", audio_monitor,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ]
+        else:
+            ffmpeg_cmd += ["-map", "0:v:0"]
+
+        if out_res == src_res:
+            ffmpeg_cmd += ["-vf", "format=yuv420p"]
+        else:
+            ffmpeg_cmd += ["-vf", f"scale={out_res.replace('x', ':')}:out_range=tv,format=yuv420p"]
+
+        ffmpeg_cmd += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-level:v", _h264_level_for_mode(self.config),
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.config.fps),
+            "-g", str(gop),
+            "-keyint_min", str(gop),
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-b:v", effective_bitrate,
+            "-maxrate", effective_bitrate,
+            "-bufsize", _double_bitrate(effective_bitrate),
+            "-x264-params", "repeat-headers=1:aud=1",
+        ]
+
+        if not self.config.no_audio:
+            ffmpeg_cmd += [
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "128k",
+                "-ac", "2",
+                "-ar", "48000",
+                "-streamid", "1:4352",
+            ]
+
+        ffmpeg_cmd += self._common_output_args()
+
+        print(
+            "[FluxCast WFD Media] Using x11grab backend for desktop capture "
+            f"from {display}+{monitor.x},{monitor.y}"
+        )
+        if not self.config.no_audio:
+            print(f"[FluxCast WFD Media] Capturing audio  : {audio_monitor}")
+        if out_res != src_res:
+            print(f"[FluxCast WFD Media] Scaling output  : {out_res}")
+        print(
+            f"[FluxCast WFD Media] RTP target      : "
+            f"{self.tv_ip}:{self.sink_rtp_port} from local port {self.config.source_port}"
+        )
+
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stderr=None)
+        time.sleep(1.0)
+        if ffmpeg_proc.poll() is not None:
+            raise WFDNotReady("ffmpeg x11grab sender exited immediately during WFD streaming.")
+        self.processes = [ffmpeg_proc]
 
 
 def _read_rtsp_message(rfile) -> Optional[RTSPMessage]:
@@ -1906,6 +2046,7 @@ def start_experimental_backend(args) -> None:
         source_port=getattr(args, "wfd_rtp_source_port", 19002),
         media_pipeline=getattr(args, "wfd_media_pipeline", "auto"),
         latency_log_path=getattr(args, "wfd_latency_log", None),
+        capture_backend=getattr(args, "wfd_capture_backend", "auto"),
     )
     if media_config.latency_log_path:
         print(f"[FluxCast WFD] Latency log file: {media_config.latency_log_path}")

@@ -41,6 +41,15 @@ Cast mode (optional, if your TV supports it):
 python3 main.py --protocol cast
 ```
 
+Force backend manually (if auto is not suitable on your session):
+
+```bash
+python3 main.py --capture-backend wf-recorder
+python3 main.py --capture-backend x11grab
+python3 main.py --protocol wfd --wfd-capture-backend wf-recorder
+python3 main.py --protocol wfd --wfd-capture-backend x11grab
+```
+
 ## What Works Best
 
 ### WFD (Primary)
@@ -87,6 +96,7 @@ WFD mode also depends on system binaries, not only Python packages:
 
 - `ffmpeg`
 - `wf-recorder` (Wayland/wlroots capture path)
+- `xdg-desktop-portal` (+ desktop backend: `xdg-desktop-portal-kde` / `xdg-desktop-portal-gnome` / `xdg-desktop-portal-wlr`)
 - `nmcli`, `gdbus`, `iw`, `wpa_cli` (Wi-Fi Direct and diagnostics)
 - `pactl` (audio monitor autodetect)
 

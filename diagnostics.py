@@ -112,6 +112,10 @@ def _display_capture_check() -> Check:
     x11 = os.environ.get("DISPLAY")
     wf_recorder = shutil.which("wf-recorder")
     xrandr = shutil.which("xrandr")
+    portal = shutil.which("xdg-desktop-portal")
+    portal_kde = shutil.which("xdg-desktop-portal-kde")
+    portal_gnome = shutil.which("xdg-desktop-portal-gnome")
+    portal_wlr = shutil.which("xdg-desktop-portal-wlr")
 
     if wayland and wf_recorder:
         return Check(
@@ -119,6 +123,14 @@ def _display_capture_check() -> Check:
             STATUS_OK,
             "Wayland capture path is available",
             f"WAYLAND_DISPLAY={wayland}; wf-recorder={wf_recorder}",
+        )
+    if wayland and portal and (portal_kde or portal_gnome or portal_wlr):
+        backend = portal_kde or portal_gnome or portal_wlr
+        return Check(
+            "screen capture",
+            STATUS_OK,
+            "Wayland portal stack is available",
+            f"WAYLAND_DISPLAY={wayland}; portal={portal}; backend={backend}",
         )
     if x11 and xrandr:
         return Check(
@@ -128,11 +140,14 @@ def _display_capture_check() -> Check:
             f"DISPLAY={x11}; xrandr={xrandr}",
         )
     if wayland:
+        detail = "Install wf-recorder or xdg-desktop-portal + desktop-specific backend."
+        if not portal:
+            detail = "xdg-desktop-portal not found; install portal stack for KDE/GNOME capture."
         return Check(
             "screen capture",
             STATUS_WARN,
-            "Wayland detected, but wf-recorder is missing",
-            "GNOME/KDE Wayland usually need a portal/PipeWire capture backend",
+            "Wayland detected, but capture backend is incomplete",
+            detail,
         )
     if x11:
         return Check(
@@ -272,6 +287,10 @@ def run_diagnostics() -> DiagnosticReport:
         _python_check(),
         _command_check("ffmpeg", "video/audio transcoding", required=True),
         _command_check("wf-recorder", "Wayland/wlroots screen capture"),
+        _command_check("xdg-desktop-portal", "Wayland portal service for KDE/GNOME capture"),
+        _command_check("xdg-desktop-portal-kde", "KDE Wayland portal backend"),
+        _command_check("xdg-desktop-portal-gnome", "GNOME Wayland portal backend"),
+        _command_check("xdg-desktop-portal-wlr", "wlroots Wayland portal backend"),
         _command_check("pactl", "PulseAudio/PipeWire-Pulse audio monitor detection"),
         _command_check("xrandr", "X11 monitor detection fallback"),
         _command_check("nmcli", "NetworkManager Wi-Fi Direct control"),

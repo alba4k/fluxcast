@@ -35,6 +35,7 @@ python3 main.py --protocol cast
 - `--fps N`
 - `--bitrate Xm`
 - `--discover-timeout N`
+- `--capture-backend auto|wf-recorder|x11grab`
 - `--transport progressive-ts|hls|live-ts`
 - `--doctor`
 - `--doctor-json`
@@ -47,6 +48,7 @@ python3 main.py --protocol cast
 - `--wfd-dry-run`
 - `--wfd-test-pattern`
 - `--wfd-media-pipeline auto|ffmpeg|gst`
+- `--wfd-capture-backend auto|wf-recorder|x11grab`
 - `--wfd-latency-log [PATH]`
 - `--wfd-no-audio`
 - `--wfd-audio-device DEVICE`
@@ -77,6 +79,10 @@ python3 main.py --protocol cast
   - HTTP server address and port for DLNA/Cast streams.
 - `--discover-timeout`
   - Discovery timeout for DLNA/Cast.
+- `--capture-backend`
+  - `auto`: selects backend by session and retries fallback backend on startup failure.
+  - `wf-recorder`: preferred for Hyprland/wlroots.
+  - `x11grab`: useful for X11 sessions.
 - `--transport`
   - `hls`: **Recommended for Samsung TVs** - more stable HLS streaming
   - `progressive-ts`: May cause freezing on some Samsung TV models
@@ -113,6 +119,10 @@ python3 main.py --protocol cast
   - `auto`: `gst` for test-pattern, `ffmpeg` for desktop.
   - `ffmpeg`: force ffmpeg sender.
   - `gst`: force GStreamer sender (currently mainly for test-pattern).
+- `--wfd-capture-backend`
+  - `auto`: tries desktop capture backends in order and falls back on startup failure.
+  - `wf-recorder`: recommended on Hyprland/wlroots.
+  - `x11grab`: useful for X11 sessions.
 - `--wfd-no-audio`
   - **Video-only mode** - May cause immediate disconnects on Samsung TVs during WFD negotiation.
   - Use primarily for diagnostic/testing purposes.
