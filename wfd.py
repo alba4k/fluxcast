@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 from diagnostics import print_report, run_diagnostics
+from portal_capture import PortalCaptureError, PortalCaptureSession, close_portal_capture, start_portal_capture
 
 
 WFD_RTSP_PORT = 7236
@@ -181,7 +182,10 @@ def _wfd_capture_backend_order(config: WFDMediaConfig) -> list[str]:
     if _is_x11_session():
         return ["x11grab", "wf-recorder"]
     if _is_wayland_session():
-        return ["wf-recorder", "x11grab"]
+        if _is_hyprland_session():
+            return ["wf-recorder", "x11grab"]
+        # Prefer portal capture on KDE/GNOME Wayland.
+        return ["portal", "wf-recorder"]
     return ["x11grab", "wf-recorder"]
 
 
@@ -207,6 +211,60 @@ def _gst_wfd_sender_available() -> bool:
         and _gst_has_element("rtpmp2tpay")
         and _gst_has_element("x264enc")
     )
+
+
+def _gst_pipewiresrc_properties() -> set[str]:
+    if not shutil.which("gst-inspect-1.0"):
+        return set()
+    try:
+        result = subprocess.run(
+            ["gst-inspect-1.0", "pipewiresrc"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+
+    props: set[str] = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s{2}([a-z0-9_-]+)\s+:", line)
+        if match:
+            props.add(match.group(1))
+    return props
+
+
+def _pipewiresrc_selector_attempts(
+    node_id: int,
+    stream_label: str = "",
+) -> list[tuple[str, list[str]]]:
+    props = _gst_pipewiresrc_properties()
+    attempts: list[tuple[str, list[str]]] = []
+    has_autoconnect = "autoconnect" in props
+
+    def _add(base_name: str, base_args: list[str]) -> None:
+        # Try compositor-friendly selector mode first.
+        if has_autoconnect:
+            attempts.append((base_name, [*base_args, "autoconnect=true"]))
+        else:
+            attempts.append((base_name, base_args))
+        # Then strict mode pinned to the selected node.
+        if has_autoconnect:
+            attempts.append((base_name + "+strict", [*base_args, "autoconnect=false"]))
+
+    if "path" in props:
+        _add("path", [f"path={node_id}"])
+    # Keep target-object fallback disabled for now. On the tested KDE/PipeWire
+    # stack this branch is unstable and can trigger gst-launch crashes. kurva...
+    _ = stream_label
+    if not attempts:
+        raise WFDNotReady(
+            "Portal backend could not target a specific PipeWire stream node: "
+            "pipewiresrc has neither target-object nor path property."
+        )
+    return attempts
 
 
 def _gst_pick_aac_encoder() -> tuple[str, list[str]]:
@@ -512,6 +570,7 @@ class WFDMediaPipeline:
         self.processes: list[subprocess.Popen[bytes]] = []
         self.tx_interface: Optional[str] = None
         self.tx_baseline: Optional[int] = None
+        self.portal_session: Optional[PortalCaptureSession] = None
 
     def start(self) -> None:
         if self.processes:
@@ -523,9 +582,6 @@ class WFDMediaPipeline:
         requested_pipeline = self.config.media_pipeline
         pipeline = requested_pipeline
         if pipeline == "auto":
-            # For WFD test-pattern smoke runs, Samsung receivers are usually
-            # more tolerant of the explicit GStreamer mpegtsmux/rtpmp2t path.
-            # Keep ffmpeg as the default sender for desktop capture.
             pipeline = "gst" if self.config.test_pattern and _gst_wfd_sender_available() else "ffmpeg"
 
         if pipeline == "gst":
@@ -563,6 +619,8 @@ class WFDMediaPipeline:
                 except subprocess.TimeoutExpired:
                     proc.kill()
         self.processes.clear()
+        close_portal_capture(self.portal_session)
+        self.portal_session = None
 
     def _rtp_output(self) -> str:
         return _rtp_url(self.tv_ip, self.sink_rtp_port, self.config.source_port, self.local_ip)
@@ -729,8 +787,6 @@ class WFDMediaPipeline:
     def _start_desktop(self) -> None:
         if not shutil.which("ffmpeg"):
             raise WFDNotReady("ffmpeg is required for WFD desktop streaming.")
-        if self.config.monitor is None:
-            raise WFDNotReady("WFD desktop streaming needs a selected monitor.")
 
         backends = _wfd_capture_backend_order(self.config)
         errors: list[str] = []
@@ -738,6 +794,8 @@ class WFDMediaPipeline:
             try:
                 if backend == "x11grab":
                     self._start_desktop_x11grab()
+                elif backend == "portal":
+                    self._start_desktop_portal()
                 else:
                     self._start_desktop_wf_recorder()
                 return
@@ -745,13 +803,233 @@ class WFDMediaPipeline:
                 errors.append(f"{backend}: {exc}")
                 if idx < len(backends) - 1:
                     print(f"[FluxCast WFD Media] Backend {backend} failed, trying fallback...")
-        raise WFDNotReady("; ".join(errors) if errors else "No usable capture backend")
+        detail = "; ".join(errors) if errors else "No usable capture backend"
+        if self.config.capture_backend == "auto" and _is_wayland_session() and not _is_hyprland_session():
+            detail += (
+                "; KDE/GNOME Wayland desktop capture uses portal backend in this build. "
+                "Install dbus-next + xdg-desktop-portal stack + gst-launch-1.0, "
+                "then allow screen-share in the portal picker dialog."
+            )
+        raise WFDNotReady(detail)
+
+    def _start_desktop_portal(self) -> None:
+        if not shutil.which("gst-launch-1.0"):
+            raise WFDNotReady("Portal backend requires gst-launch-1.0 (pipewiresrc pipeline).")
+        required = (
+            "pipewiresrc", "videoconvert", "videoscale",
+            "x264enc", "mpegtsmux", "rtpmp2tpay", "udpsink",
+        )
+        if not self.config.no_audio:
+            required += ("pulsesrc", "audioconvert", "audioresample", "aacparse")
+        missing = [name for name in required
+                   if not _gst_has_element(name)]
+        if missing:
+            raise WFDNotReady(
+                "Portal backend is missing required GStreamer elements: "
+                + ", ".join(missing)
+            )
+        monitor = self.config.monitor
+        if self.config.output_resolution:
+            out_res = self.config.output_resolution
+        elif monitor is not None:
+            out_res = f"{monitor.width}x{monitor.height}"
+        else:
+            out_res = "1920x1080"
+        src_res = out_res
+        audio_monitor = self.config.audio_device or _detect_audio_monitor()
+        gop = max(1, self.config.fps)
+        parsed_out = _parse_resolution(out_res) or (1920, 1080)
+        requested_kbits = _bitrate_to_kbits(self.config.bitrate)
+        floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
+        effective_kbits = max(requested_kbits, floor_kbits)
+        effective_bitrate = _kbits_to_bitrate_text(effective_kbits)
+        if effective_kbits > requested_kbits:
+            print(
+                "[FluxCast WFD Media] Raising bitrate for desktop clarity: "
+                f"{self.config.bitrate} -> {effective_bitrate}"
+            )
+
+        print("[FluxCast WFD Media] Opening portal screen-share dialog (KDE/GNOME Wayland)...")
+        try:
+            self.portal_session = start_portal_capture(
+                timeout=120.0,
+                preferred_position=(monitor.x, monitor.y) if monitor is not None else None,
+                preferred_size=(monitor.width, monitor.height) if monitor is not None else None,
+            )
+        except PortalCaptureError as exc:
+            raise WFDNotReady(f"portal capture setup failed: {exc}") from exc
+
+        session = self.portal_session
+        if session.source_type is not None and session.source_type != 1:
+            close_portal_capture(self.portal_session)
+            self.portal_session = None
+            raise WFDNotReady(
+                "Portal returned a non-monitor source (likely camera/window). "
+                "In the portal picker choose a full monitor/screen."
+            )
+        if session.source_type is None:
+            close_portal_capture(self.portal_session)
+            self.portal_session = None
+            raise WFDNotReady(
+                "Portal stream metadata has no source_type, cannot verify monitor capture safely. "
+                "In KDE portal picker select only a full screen and retry."
+            )
+
+        if session.size is not None:
+            src_res = f"{session.size[0]}x{session.size[1]}"
+        parsed_src = _parse_resolution(src_res) or (1920, 1080)
+        out_dims = _parse_resolution(out_res) or parsed_src
+        out_w, out_h = out_dims
+        selector_attempts = _pipewiresrc_selector_attempts(
+            session.pw_node_id,
+            stream_label=session.stream_label,
+        )
+        bitrate_kbits = _bitrate_to_kbits(effective_bitrate)
+        prog_map = "program_map,sink_4113=1"
+
+        def _gst_video_chain(video_caps: str, selector_args: list[str]) -> list[str]:
+            return [
+                "pipewiresrc",
+                f"fd={session.pw_fd}",
+                *selector_args,
+                "do-timestamp=true",
+                "always-copy=true",
+                "!", "queue", "max-size-buffers=8", "leaky=downstream",
+                "!", "videoconvert",
+                "!", "videoscale",
+                "!", video_caps,
+                "!", "videoconvert",
+                "!", "x264enc",
+                "tune=zerolatency",
+                "speed-preset=veryfast",
+                f"bitrate={bitrate_kbits}",
+                f"key-int-max={gop}",
+                "bframes=0",
+                "byte-stream=true",
+                "aud=true",
+                "sliced-threads=true",
+                "vbv-buf-capacity=200",
+                "!", "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline",
+                "!", "queue",
+                "!", "mux.sink_4113",
+            ]
+
+        gst_audio_chain: list[str] = []
+        if not self.config.no_audio:
+            audio_encoder, audio_caps = _gst_pick_aac_encoder()
+            prog_map += ",sink_4352=1"
+            gst_audio_chain = [
+                "pulsesrc", f"device={audio_monitor}",
+                "!", "audioconvert",
+                "!", "audioresample",
+                "!", *audio_caps,
+                "!", audio_encoder, "bitrate=128000",
+                "!", "aacparse",
+                "!", "queue",
+                "!", "mux.sink_4352",
+            ]
+
+        def _gst_cmd_for_caps(video_caps: str, selector_args: list[str]) -> list[str]:
+            return [
+                "gst-launch-1.0", "-e", "-q",
+                "mpegtsmux", "name=mux",
+                "alignment=7",
+                f"prog-map={prog_map}",
+                "pat-interval=9000",
+                "pmt-interval=9000",
+                "pcr-interval=3600",
+                "!", "rtpmp2tpay", "pt=33", "mtu=1328",
+                "!", "udpsink",
+                f"host={self.tv_ip}",
+                f"port={self.sink_rtp_port}",
+                f"bind-address={self.local_ip}",
+                f"bind-port={self.config.source_port}",
+                "sync=false",
+                "async=false",
+                *_gst_video_chain(video_caps, selector_args),
+                *gst_audio_chain,
+            ]
+
+        caps_strict = (
+            f"video/x-raw,width={out_w},height={out_h},"
+            f"framerate={self.config.fps}/1"
+        )
+        caps_no_fps = (
+            f"video/x-raw,width={out_w},height={out_h}"
+        )
+        caps_relaxed = "video/x-raw"
+        caps_attempts = [
+            ("strict", caps_strict),
+            ("no-fps", caps_no_fps),
+            ("relaxed", caps_relaxed),
+        ]
+
+        print(f"[FluxCast WFD Media] Capturing via portal node : {session.pw_node_id}")
+        print(
+            "[FluxCast WFD Media] PipeWire selectors      : "
+            + ", ".join(name for name, _ in selector_attempts)
+        )
+        print("[FluxCast WFD Media] Pipeline             : gstreamer (portal->rtp)")
+        print(f"[FluxCast WFD Media] Portal source type      : {session.source_type}")
+        if session.position and session.size:
+            print(
+                "[FluxCast WFD Media] Portal source geometry : "
+                f"pos={session.position[0]},{session.position[1]} "
+                f"size={session.size[0]}x{session.size[1]}"
+            )
+        if session.stream_label:
+            print(f"[FluxCast WFD Media] Portal source id       : {session.stream_label}")
+        if not self.config.no_audio:
+            print(f"[FluxCast WFD Media] Capturing audio       : {audio_monitor}")
+        if out_dims != parsed_src:
+            print(f"[FluxCast WFD Media] Scaling output       : {out_res}")
+        print(
+            f"[FluxCast WFD Media] RTP target           : "
+            f"{self.tv_ip}:{self.sink_rtp_port} from local port {self.config.source_port}"
+        )
+        gst_proc = None
+        probe_alive_seconds = 3.0
+        for selector_name, selector_args in selector_attempts:
+            for attempt_name, attempt_caps in caps_attempts:
+                print(
+                    f"[FluxCast WFD Media] Portal attempt       : "
+                    f"selector={selector_name}, caps={attempt_name}"
+                )
+                gst_cmd = _gst_cmd_for_caps(attempt_caps, selector_args)
+                gst_proc = subprocess.Popen(gst_cmd, stderr=None, pass_fds=(session.pw_fd,))
+                time.sleep(2.5)
+                if gst_proc.poll() is not None:
+                    print(
+                        "[FluxCast WFD Media] Portal attempt failed; trying next "
+                        "selector/caps combination..."
+                    )
+                    continue
+
+                # Some combinations keep gst process alive but produce almost no RTP
+                # payload (black/frozen sink output). Verify real egress before
+                # accepting this attempt.
+                time.sleep(probe_alive_seconds)
+                if gst_proc.poll() is not None:
+                    print(
+                        "[FluxCast WFD Media] Portal attempt died during TX probe; "
+                        "trying next selector/caps combination..."
+                    )
+                    continue
+
+                self.processes = [gst_proc]
+                return
+
+        close_portal_capture(self.portal_session)
+        self.portal_session = None
+        raise WFDNotReady("portal GStreamer RTP pipeline failed to negotiate formats.")
 
     def _start_desktop_wf_recorder(self) -> None:
         if not shutil.which("wf-recorder"):
             raise WFDNotReady("wf-recorder is required for WFD desktop streaming.")
 
         monitor = self.config.monitor
+        if monitor is None:
+            raise WFDNotReady("wf-recorder backend requires a selected monitor.")
         src_res = f"{monitor.width}x{monitor.height}"
         out_res = self.config.output_resolution or src_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
@@ -864,6 +1142,8 @@ class WFDMediaPipeline:
 
     def _start_desktop_x11grab(self) -> None:
         monitor = self.config.monitor
+        if monitor is None:
+            raise WFDNotReady("x11grab backend requires a selected monitor.")
         src_res = f"{monitor.width}x{monitor.height}"
         out_res = self.config.output_resolution or src_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
@@ -2010,8 +2290,18 @@ def start_experimental_backend(args) -> None:
 
     monitor = None
     if not getattr(args, "wfd_test_pattern", False) and not getattr(args, "wfd_dry_run", False):
-        from capture import prompt_monitor
-        monitor = prompt_monitor()
+        selected_backend = getattr(args, "wfd_capture_backend", "auto")
+        portal_mode = selected_backend == "portal" or (
+            selected_backend == "auto" and _is_wayland_session() and not _is_hyprland_session()
+        )
+        if portal_mode:
+            print(
+                "[FluxCast WFD] Portal backend: monitor selection will be done "
+                "in the desktop portal dialog."
+            )
+        else:
+            from capture import prompt_monitor
+            monitor = prompt_monitor()
 
     peers = active_scan(interface=args.wfd_interface, timeout=args.wfd_timeout)
     peer = _select_peer(peers, getattr(args, "wfd_peer", None))
@@ -2058,6 +2348,11 @@ def start_experimental_backend(args) -> None:
     connected = False
     active_path = ""
     try:
+        # Clear stale P2P device state from previous runs before new activation.
+        try:
+            _disconnect_device(device_path)
+        except Exception:
+            pass
         rtsp.start()
         active_path = _connect_peer(
             device_path,

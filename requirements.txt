@@ -1,2 +1,3 @@
 upnpclient>=1.0.3
 pychromecast>=14.0.5
+dbus-next>=0.2.3

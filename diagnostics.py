@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import platform
 import re
@@ -48,8 +49,23 @@ def _run(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[s
     )
 
 
-def _command_check(binary: str, purpose: str, required: bool = False) -> Check:
+def _find_binary(binary: str, extra_paths: Optional[list[str]] = None) -> Optional[str]:
     path = shutil.which(binary)
+    if path:
+        return path
+    for candidate in extra_paths or []:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _command_check(
+    binary: str,
+    purpose: str,
+    required: bool = False,
+    extra_paths: Optional[list[str]] = None,
+) -> Check:
+    path = _find_binary(binary, extra_paths=extra_paths)
     if path:
         return Check(binary, STATUS_OK, purpose, path)
 
@@ -62,6 +78,18 @@ def _first_matching_command(commands: list[str]) -> Optional[str]:
         if shutil.which(command):
             return command
     return None
+
+
+def _python_module_check(module: str, purpose: str, required: bool = False) -> Check:
+    if importlib.util.find_spec(module) is not None:
+        return Check(module, STATUS_OK, purpose, "python module is installed")
+    status = STATUS_FAIL if required else STATUS_WARN
+    return Check(
+        module,
+        status,
+        purpose,
+        "python module is missing; install with pip",
+    )
 
 
 def _ffmpeg_encoders() -> Check:
@@ -110,12 +138,24 @@ def _ffmpeg_encoders() -> Check:
 def _display_capture_check() -> Check:
     wayland = os.environ.get("WAYLAND_DISPLAY")
     x11 = os.environ.get("DISPLAY")
-    wf_recorder = shutil.which("wf-recorder")
+    wf_recorder = _find_binary("wf-recorder")
     xrandr = shutil.which("xrandr")
-    portal = shutil.which("xdg-desktop-portal")
-    portal_kde = shutil.which("xdg-desktop-portal-kde")
-    portal_gnome = shutil.which("xdg-desktop-portal-gnome")
-    portal_wlr = shutil.which("xdg-desktop-portal-wlr")
+    portal = _find_binary(
+        "xdg-desktop-portal",
+        extra_paths=["/usr/libexec/xdg-desktop-portal", "/usr/lib/xdg-desktop-portal"],
+    )
+    portal_kde = _find_binary(
+        "xdg-desktop-portal-kde",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-kde", "/usr/lib/xdg-desktop-portal-kde"],
+    )
+    portal_gnome = _find_binary(
+        "xdg-desktop-portal-gnome",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome"],
+    )
+    portal_wlr = _find_binary(
+        "xdg-desktop-portal-wlr",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-wlr", "/usr/lib/xdg-desktop-portal-wlr"],
+    )
 
     if wayland and wf_recorder:
         return Check(
@@ -283,14 +323,35 @@ def _python_check() -> Check:
 
 
 def run_diagnostics() -> DiagnosticReport:
+    portal_bin_paths = ["/usr/libexec/xdg-desktop-portal", "/usr/lib/xdg-desktop-portal"]
+    portal_kde_bin_paths = ["/usr/libexec/xdg-desktop-portal-kde", "/usr/lib/xdg-desktop-portal-kde"]
+    portal_gnome_bin_paths = ["/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome"]
+    portal_wlr_bin_paths = ["/usr/libexec/xdg-desktop-portal-wlr", "/usr/lib/xdg-desktop-portal-wlr"]
+
     checks = [
         _python_check(),
         _command_check("ffmpeg", "video/audio transcoding", required=True),
         _command_check("wf-recorder", "Wayland/wlroots screen capture"),
-        _command_check("xdg-desktop-portal", "Wayland portal service for KDE/GNOME capture"),
-        _command_check("xdg-desktop-portal-kde", "KDE Wayland portal backend"),
-        _command_check("xdg-desktop-portal-gnome", "GNOME Wayland portal backend"),
-        _command_check("xdg-desktop-portal-wlr", "wlroots Wayland portal backend"),
+        _command_check(
+            "xdg-desktop-portal",
+            "Wayland portal service for KDE/GNOME capture",
+            extra_paths=portal_bin_paths,
+        ),
+        _command_check(
+            "xdg-desktop-portal-kde",
+            "KDE Wayland portal backend",
+            extra_paths=portal_kde_bin_paths,
+        ),
+        _command_check(
+            "xdg-desktop-portal-gnome",
+            "GNOME Wayland portal backend",
+            extra_paths=portal_gnome_bin_paths,
+        ),
+        _command_check(
+            "xdg-desktop-portal-wlr",
+            "wlroots Wayland portal backend",
+            extra_paths=portal_wlr_bin_paths,
+        ),
         _command_check("pactl", "PulseAudio/PipeWire-Pulse audio monitor detection"),
         _command_check("xrandr", "X11 monitor detection fallback"),
         _command_check("nmcli", "NetworkManager Wi-Fi Direct control"),
@@ -299,6 +360,7 @@ def run_diagnostics() -> DiagnosticReport:
         _command_check("gdbus", "passive wpa_supplicant D-Bus capability checks"),
         _command_check("gst-launch-1.0", "optional future WFD GStreamer pipeline"),
         _command_check("gst-inspect-1.0", "optional future WFD codec inspection"),
+        _python_module_check("dbus_next", "WFD portal capture control plane for KDE/GNOME Wayland"),
         _ffmpeg_encoders(),
         _display_capture_check(),
         _audio_check(),

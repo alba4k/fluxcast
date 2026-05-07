@@ -79,7 +79,8 @@ def _auto_capture_backend_order() -> list[str]:
     if session.is_x11:
         return ["x11grab", "wf-recorder"]
     if session.is_wayland:
-        return ["wf-recorder", "x11grab"]
+        # x11grab under Wayland often captures an empty Xwayland root and appears black.
+        return ["wf-recorder"]
     return ["x11grab", "wf-recorder"]
 
 
@@ -98,7 +99,12 @@ def describe_capture_selection(backend: str) -> None:
     if backend == "wf-recorder" and session.is_wayland and not session.is_hyprland:
         print(
             "[FluxCast] Capture backend: wf-recorder (best-effort on this Wayland session). "
-            "If capture fails, try X11 session or upcoming portal backend."
+            "If capture fails, use an X11 session or install portal stack for KDE/GNOME."
+        )
+    elif backend == "x11grab" and session.is_wayland:
+        print(
+            "[FluxCast] Capture backend: x11grab (forced). "
+            "On Wayland this may produce a black stream."
         )
     else:
         print(f"[FluxCast] Capture backend: {backend}")
@@ -220,6 +226,12 @@ def start_capture(
                 print(f"[FluxCast] Capture backend {candidate} failed, trying fallback...")
 
     detail = "; ".join(errors) if errors else "unknown capture error"
+    session = detect_session()
+    if session.is_wayland and not session.is_hyprland:
+        detail += (
+            "; KDE/GNOME Wayland desktop capture via portal is not enabled in this build yet. "
+            "Use X11 session for desktop capture or test WFD with --wfd-test-pattern."
+        )
     print(f"[FluxCast] ERROR: Could not start capture backend ({detail})")
     sys.exit(1)
 

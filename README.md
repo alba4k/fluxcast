@@ -2,6 +2,10 @@
 
 FluxCast streams a Linux desktop to a TV.
 
+## Demo
+
+https://github.com/user-attachments/assets/ce01804c-2f86-4a5d-8ecf-d6f2a72f55d1
+
 ## Project Status
 
 FluxCast is currently in **early $\mathbf{\color{red}!!!ALPHA!!!}$ testing**. 
@@ -14,6 +18,11 @@ Current validated scope:
 
 The project currently focuses on **WFD/Miracast on Linux (Hyprland/wlroots class setups)**.  
 DLNA and Cast are available, but they are best treated as fallback or experimental paths.
+
+Current limitation:
+
+- KDE/GNOME Wayland desktop capture now uses `xdg-desktop-portal` in WFD mode.
+- For portal mode, install Python dependency `dbus-next` and allow screen-share in the desktop picker dialog.
 
 ## Quick Start
 
@@ -46,6 +55,7 @@ Force backend manually (if auto is not suitable on your session):
 ```bash
 python3 main.py --capture-backend wf-recorder
 python3 main.py --capture-backend x11grab
+python3 main.py --protocol wfd --wfd-capture-backend portal
 python3 main.py --protocol wfd --wfd-capture-backend wf-recorder
 python3 main.py --protocol wfd --wfd-capture-backend x11grab
 ```
@@ -107,6 +117,8 @@ python3 main.py --doctor
 ```
 
 to check your machine before running WFD.
+
+Note: on KDE/GNOME Wayland, WFD auto backend now prefers `portal` first.
 
 
 ## Documentation

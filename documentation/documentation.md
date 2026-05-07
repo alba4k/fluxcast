@@ -48,7 +48,8 @@ python3 main.py --protocol cast
 - `--wfd-dry-run`
 - `--wfd-test-pattern`
 - `--wfd-media-pipeline auto|ffmpeg|gst`
-- `--wfd-capture-backend auto|wf-recorder|x11grab`
+- `--wfd-capture-backend auto|portal|wf-recorder|x11grab`
+  - `auto` uses `portal` first on KDE/GNOME Wayland, then `wf-recorder` fallback.
 - `--wfd-latency-log [PATH]`
 - `--wfd-no-audio`
 - `--wfd-audio-device DEVICE`
@@ -121,8 +122,10 @@ python3 main.py --protocol cast
   - `gst`: force GStreamer sender (currently mainly for test-pattern).
 - `--wfd-capture-backend`
   - `auto`: tries desktop capture backends in order and falls back on startup failure.
+  - `portal`: Wayland ScreenCast through xdg-desktop-portal (KDE/GNOME preferred path).
   - `wf-recorder`: recommended on Hyprland/wlroots.
   - `x11grab`: useful for X11 sessions.
+  - `portal` backend requirements: `dbus-next`, `xdg-desktop-portal`, desktop portal backend, and `gst-launch-1.0`.
 - `--wfd-no-audio`
   - **Video-only mode** - May cause immediate disconnects on Samsung TVs during WFD negotiation.
   - Use primarily for diagnostic/testing purposes.
