@@ -93,7 +93,7 @@ desktop capture -> HTTP stream -> DLNA/UPnP AVTransport -> native TV player
 ```bash
 git clone https://github.com/IlyaP358/fluxcast.git
 cd fluxcast
-python3 -m venv venv # if you may use only miracast dont need it
+python3 -m venv venv
 pip install -r requirements.txt
 python3 main.py # and flags as you need
 ```
