@@ -888,19 +888,29 @@ class WFDMediaPipeline:
         prog_map = "program_map,sink_4113=1"
 
         def _gst_video_chain(video_caps: str, selector_args: list[str]) -> list[str]:
+            # Use more buffers for high-res 1440p capture and move videorate early
+            props = _gst_pipewiresrc_properties()
+            pipewire_args = [*selector_args]
+            if "max-buffers" in props:
+                pipewire_args.append("max-buffers=64")
+            if "resend-last" in props:
+                pipewire_args.append("resend-last=true")
+            if "min-force-user-latency" in props:
+                pipewire_args.append("min-force-user-latency=0")
+
             return [
                 "pipewiresrc",
                 f"fd={session.pw_fd}",
-                *selector_args,
+                *pipewire_args,
                 "do-timestamp=true",
                 "always-copy=false",
                 "keepalive-time=33",
-                "!", "queue", "max-size-buffers=32", "max-size-time=300000000", "leaky=no",
+                "!", "queue", "max-size-buffers=64", "max-size-time=1000000000", "leaky=downstream",
+                "!", "videorate", "skip-to-first=true",
+                "!", f"video/x-raw,framerate={self.config.fps}/1",
                 "!", "videoconvert",
                 "!", "videoscale",
                 "!", video_caps,
-                "!", "videorate",
-                "!", f"video/x-raw,framerate={self.config.fps}/1",
                 "!", "videoconvert",
                 "!", "video/x-raw,format=I420",
                 "!", "x264enc",
