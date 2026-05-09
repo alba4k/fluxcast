@@ -1,5 +1,6 @@
 import re
 import random
+import socket
 import socketserver
 import shutil
 import subprocess
@@ -16,7 +17,6 @@ from portal_capture import PortalCaptureError, PortalCaptureSession, close_porta
 
 
 WFD_RTSP_PORT = 7236
-WFD_SOURCE_IE_TEMPLATE = bytes.fromhex("00000600901c4400c8")
 
 # WFD CEA resolution bitmask. The current backend intentionally negotiates
 # only the !common! HD modes that Samsung TVs usually accept reliably.
@@ -31,6 +31,37 @@ WFD_LEVEL_42 = 0x10
 WFD_AUDIO_AAC = "AAC 00000001 00"
 NM_DEST = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
+
+
+def _wfd_ie_device_info(rtsp_port: int) -> bytes:
+    """
+    WFD Subelement ID 0: WFD Device Information (6 bytes)
+    Byte 0-1: Device Information bitmask
+              (0x0010 = Source, 0x0000 = Coupled Sink not supported)
+    Byte 2-3: Session Management Control Port (RTSP port)
+    Byte 4-5: Device Throughput (max 100 Mbps)
+    """
+    return bytes([
+        0x00, 0x00, 0x06,
+        0x00, 0x90,  # Info: Source, Coupled Sink support
+        (rtsp_port >> 8) & 0xff, rtsp_port & 0xff,
+        0x00, 0xc8   # Throughput: 100 Mbps
+    ])
+
+
+def _wfd_ie_device_name(name: str) -> bytes:
+    """
+    WFD Subelement ID 10: WFD Device Name
+    """
+    encoded = name.encode("utf-8")
+    length = len(encoded)
+    return bytes([0x0a, (length >> 8) & 0xff, length & 0xff]) + encoded
+
+
+def _wfd_ie_for_rtsp_port(port: int) -> str:
+    hostname = socket.gethostname() or "FluxCast"
+    ie_bytes = _wfd_ie_device_info(port) + _wfd_ie_device_name(hostname)
+    return ie_bytes.hex()
 
 
 @dataclass
@@ -88,6 +119,7 @@ class WFDMediaConfig:
     media_pipeline: str = "auto"
     latency_log_path: Optional[str] = None
     capture_backend: str = "auto"
+    peer_name: str = ""
 
 
 @dataclass
@@ -328,6 +360,19 @@ def _quality_floor_kbits(width: int, height: int, fps: int) -> int:
     if pixels <= 1920 * 1080:
         return 8000 if fps <= 30 else 12000
     return 12000 if fps <= 30 else 16000
+
+
+def _calculate_gop(config: WFDMediaConfig) -> int:
+    """
+    Calculate Group of Pictures (GOP) size.
+    LG TVs are strict and often require more frequent keyframes (IDR frames)
+    to maintain a stable session, especially during initial buffering.
+    """
+    gop = max(1, config.fps)
+    if "LG" in config.peer_name.upper():
+        # For LG, use a 0.5s or 1s GOP but no more than 30 frames.
+        return min(gop, 30)
+    return gop
 
 
 def _append_latency_log(path: Optional[str], event: str, **fields: object) -> None:
@@ -651,6 +696,7 @@ class WFDMediaPipeline:
             raise WFDNotReady("ffmpeg is required for WFD test-pattern streaming.")
 
         resolution = self.config.output_resolution or "1280x720"
+        gop = _calculate_gop(self.config)
         cmd = [
             "ffmpeg", "-hide_banner", "-y",
             "-loglevel", "warning",
@@ -678,8 +724,8 @@ class WFDMediaPipeline:
             "-level:v", _h264_level_for_mode(self.config),
             "-pix_fmt", "yuv420p",
             "-r", str(self.config.fps),
-            "-g", str(max(1, self.config.fps)),
-            "-keyint_min", str(max(1, self.config.fps)),
+            "-g", str(gop),
+            "-keyint_min", str(gop),
             "-sc_threshold", "0",
             "-bf", "0",
             "-b:v", self.config.bitrate,
@@ -721,6 +767,7 @@ class WFDMediaPipeline:
         resolution = _parse_resolution(self.config.output_resolution) or (1280, 720)
         width, height = resolution
         bitrate_kbits = _bitrate_to_kbits(self.config.bitrate)
+        gop = _calculate_gop(self.config)
 
         prog_map = "program_map,sink_4113=1"
         if not self.config.no_audio:
@@ -749,7 +796,7 @@ class WFDMediaPipeline:
             "tune=zerolatency",
             "speed-preset=ultrafast",
             f"bitrate={bitrate_kbits}",
-            f"key-int-max={max(1, self.config.fps)}",
+            f"key-int-max={gop}",
             "bframes=0",
             "byte-stream=true",
             "aud=true",
@@ -837,7 +884,7 @@ class WFDMediaPipeline:
             out_res = "1920x1080"
         src_res = out_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
-        gop = max(1, self.config.fps)
+        gop = _calculate_gop(self.config)
         parsed_out = _parse_resolution(out_res) or (1920, 1080)
         requested_kbits = _bitrate_to_kbits(self.config.bitrate)
         floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
@@ -1048,7 +1095,7 @@ class WFDMediaPipeline:
         src_res = f"{monitor.width}x{monitor.height}"
         out_res = self.config.output_resolution or src_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
-        gop = max(1, self.config.fps)
+        gop = _calculate_gop(self.config)
         parsed_out = _parse_resolution(out_res) or (monitor.width, monitor.height)
         requested_kbits = _bitrate_to_kbits(self.config.bitrate)
         floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
@@ -1162,7 +1209,7 @@ class WFDMediaPipeline:
         src_res = f"{monitor.width}x{monitor.height}"
         out_res = self.config.output_resolution or src_res
         audio_monitor = self.config.audio_device or _detect_audio_monitor()
-        gop = max(1, self.config.fps)
+        gop = _calculate_gop(self.config)
         parsed_out = _parse_resolution(out_res) or (monitor.width, monitor.height)
         requested_kbits = _bitrate_to_kbits(self.config.bitrate)
         floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
@@ -1468,7 +1515,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
 
     def _send_m4_set_parameters(self) -> None:
         if not self.sink_rtp_port:
-            raise WFDNotReady("Samsung did not provide a valid RTP port in M3.")
+            raise WFDNotReady("TV did not provide a valid RTP port in M3.")
         sink_rtcp_port = self.sink_rtcp_port if self.sink_rtcp_port > 0 else 0
         body = (
             f"wfd_video_formats: {self._video_format()}\r\n"
@@ -1504,7 +1551,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             ports = _parse_rtp_ports(params.get("wfd_client_rtp_ports", ""))
             if not ports or ports[0] <= 0:
                 raise WFDNotReady(
-                    "Samsung M3 response did not include a usable wfd_client_rtp_ports value."
+                    "TV M3 response did not include a usable wfd_client_rtp_ports value."
                 )
             self.sink_rtp_port, self.sink_rtcp_port = ports
             self.source_rtp_port = _safe_source_port(
@@ -1528,7 +1575,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 )
             mode = self._cea_mode()
             print(
-                f"[FluxCast WFD RTSP] Samsung RTP port: {self.sink_rtp_port}; "
+                f"[FluxCast WFD RTSP] TV RTP port: {self.sink_rtp_port}; "
                 f"source port: {self.source_rtp_port}; audio={audio or 'unknown'}"
             )
             print(f"[FluxCast WFD RTSP] Negotiated media mode: {mode.name}")
@@ -1570,7 +1617,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         if method == "SET_PARAMETER":
             if "wfd_idr_request" in msg.body:
                 print(
-                    "[FluxCast WFD RTSP] Samsung requested an IDR frame; "
+                    "[FluxCast WFD RTSP] Sink requested an IDR frame; "
                     "next GOP is <= 1s"
                 )
             self._send_response(msg, headers=self._session_header())
@@ -1960,7 +2007,7 @@ def _wait_for_nm_activation(active_path: str, timeout: float = 35.0) -> None:
             last_status = status
 
         if state == 2:
-            print("[FluxCast WFD] P2P link is activated; waiting for Samsung RTSP...")
+            print("[FluxCast WFD] P2P link is activated; waiting for RTSP session...")
             return
         if state == 4:
             raise WFDNotReady(
@@ -2066,10 +2113,9 @@ def _variant_byte_array(data: bytes) -> str:
 def _wfd_source_ie(rtsp_port: int) -> bytes:
     if rtsp_port <= 0 or rtsp_port > 65535:
         raise WFDNotReady(f"Invalid WFD RTSP port: {rtsp_port}")
-    data = bytearray(WFD_SOURCE_IE_TEMPLATE)
-    data[5] = (rtsp_port >> 8) & 0xff
-    data[6] = rtsp_port & 0xff
-    return bytes(data)
+    # Build WFD IE with Device Info and Device Name subelements.
+    hostname = socket.gethostname() or "FluxCast"
+    return _wfd_ie_device_info(rtsp_port) + _wfd_ie_device_name(hostname)
 
 
 def _connection_settings(peer: WFDPeer, rtsp_port: int) -> str:
@@ -2352,6 +2398,7 @@ def start_experimental_backend(args) -> None:
         media_pipeline=getattr(args, "wfd_media_pipeline", "auto"),
         latency_log_path=getattr(args, "wfd_latency_log", None),
         capture_backend=getattr(args, "wfd_capture_backend", "auto"),
+        peer_name=peer.name,
     )
     if media_config.latency_log_path:
         print(f"[FluxCast WFD] Latency log file: {media_config.latency_log_path}")
@@ -2376,7 +2423,7 @@ def start_experimental_backend(args) -> None:
         )
         connected = True
         _wait_for_nm_activation(active_path)
-        print("[FluxCast WFD] Waiting for Samsung RTSP/WFD session. Press Ctrl+C to stop.")
+        print("[FluxCast WFD] Waiting for TV RTSP/WFD session. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
