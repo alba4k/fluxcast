@@ -317,12 +317,22 @@ def _gst_pick_aac_encoder() -> tuple[str, list[str]]:
     )
 
 
-def _double_bitrate(value: str) -> str:
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", value)
+def _vbv_bufsize(bitrate_text: str, config: WFDMediaConfig) -> str:
+    """
+    Calculate VBV buffer size.
+    """
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)([kKmMgG]?)\s*", bitrate_text)
     if not match:
-        return value
-    amount = float(match.group(1)) * 2
+        return bitrate_text
+    
+    amount = float(match.group(1))
     suffix = match.group(2)
+    
+    is_lg = "LG" in config.peer_name.upper()
+    # For LG, use 0.5x bitrate (500ms buffer) for others and my samsung 2x (2s buffer).
+    multiplier = 0.5 if is_lg else 2.0
+    
+    amount *= multiplier
     amount_text = str(int(amount)) if amount.is_integer() else f"{amount:g}"
     return amount_text + suffix
 
@@ -731,7 +741,7 @@ class WFDMediaPipeline:
             "-bf", "0",
             "-b:v", self.config.bitrate,
             "-maxrate", self.config.bitrate,
-            "-bufsize", _double_bitrate(self.config.bitrate),
+            "-bufsize", _vbv_bufsize(self.config.bitrate, self.config),
             "-x264-params", "repeat-headers=1:aud=1",
         ]
 
@@ -890,6 +900,11 @@ class WFDMediaPipeline:
         requested_kbits = _bitrate_to_kbits(self.config.bitrate)
         floor_kbits = _quality_floor_kbits(parsed_out[0], parsed_out[1], self.config.fps)
         effective_kbits = max(requested_kbits, floor_kbits)
+
+        is_lg = "LG" in self.config.peer_name.upper()
+        if is_lg:
+            effective_kbits = min(effective_kbits, 4000)
+
         effective_bitrate = _kbits_to_bitrate_text(effective_kbits)
         if effective_kbits > requested_kbits:
             print(
@@ -946,6 +961,31 @@ class WFDMediaPipeline:
             if "min-force-user-latency" in props:
                 pipewire_args.append("min-force-user-latency=0")
 
+            is_lg = "LG" in self.config.peer_name.upper()
+
+            # x264enc configuration
+            encoder_args = [
+                "tune=zerolatency",
+                "speed-preset=ultrafast",
+                f"bitrate={bitrate_kbits}",
+                f"key-int-max={gop}",
+                "threads=0",
+                "bframes=0",
+                "byte-stream=true",
+                "aud=true",
+                "sliced-threads=true",
+            ]
+
+            if is_lg:
+                # LG Profile: Hard VBV ceiling to prevent connection resets on spikes.
+                encoder_args += [
+                    f"vbv-maxrate={bitrate_kbits}",
+                    "vbv-buf-capacity=100",
+                    "rc-lookahead=0",
+                ]
+            else:
+                encoder_args += ["vbv-buf-capacity=200"]
+
             return [
                 "pipewiresrc",
                 f"fd={session.pw_fd}",
@@ -962,16 +1002,7 @@ class WFDMediaPipeline:
                 "!", "videoconvert",
                 "!", "video/x-raw,format=I420",
                 "!", "x264enc",
-                "tune=zerolatency",
-                "speed-preset=ultrafast",
-                f"bitrate={bitrate_kbits}",
-                f"key-int-max={gop}",
-                "threads=0",
-                "bframes=0",
-                "byte-stream=true",
-                "aud=true",
-                "sliced-threads=true",
-                "vbv-buf-capacity=200",
+                *encoder_args,
                 "!", "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline",
                 "!", "queue",
                 "!", "mux.sink_4113",
@@ -1159,7 +1190,7 @@ class WFDMediaPipeline:
             "-bf", "0",
             "-b:v", effective_bitrate,
             "-maxrate", effective_bitrate,
-            "-bufsize", _double_bitrate(effective_bitrate),
+            "-bufsize", _vbv_bufsize(effective_bitrate, self.config),
             "-x264-params", "repeat-headers=1:aud=1",
         ]
 
@@ -1263,7 +1294,7 @@ class WFDMediaPipeline:
             "-bf", "0",
             "-b:v", effective_bitrate,
             "-maxrate", effective_bitrate,
-            "-bufsize", _double_bitrate(effective_bitrate),
+            "-bufsize", _vbv_bufsize(effective_bitrate, self.config),
             "-x264-params", "repeat-headers=1:aud=1",
         ]
 
