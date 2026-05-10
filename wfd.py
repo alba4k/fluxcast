@@ -59,8 +59,9 @@ def _wfd_ie_device_name(name: str) -> bytes:
 
 
 def _wfd_ie_for_rtsp_port(port: int) -> str:
-    hostname = socket.gethostname() or "FluxCast"
-    ie_bytes = _wfd_ie_device_info(port) + _wfd_ie_device_name(hostname)
+    # Use a static name "FluxCast" to ensure consistency during P2P negotiation.
+    # Some TVs like LG might be sensitive to hostname changes or special characters.
+    ie_bytes = _wfd_ie_device_info(port) + _wfd_ie_device_name("FluxCast")
     return ie_bytes.hex()
 
 
@@ -1453,7 +1454,11 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             f"{method} {uri} RTSP/1.0",
             f"CSeq: {cseq}",
         ]
+        if headers and "Session" in headers:
+            output.append(f"Session: {headers['Session']}")
         for key, value in (headers or {}).items():
+            if key == "Session":
+                continue
             output.append(f"{key}: {value}")
         if body:
             output.append("Content-Type: text/parameters")
@@ -1477,9 +1482,13 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         output = [
             f"RTSP/1.0 {status}",
             f"CSeq: {msg.cseq}",
-            "Server: FluxCast-WFD/0.1",
         ]
+        if headers and "Session" in headers:
+            output.append(f"Session: {headers['Session']}")
+        output.append("Server: FluxCast-WFD/0.1")
         for key, value in (headers or {}).items():
+            if key == "Session":
+                continue
             output.append(f"{key}: {value}")
         if body:
             output.append("Content-Type: text/parameters")
@@ -1620,6 +1629,9 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                     "[FluxCast WFD RTSP] Sink requested an IDR frame; "
                     "next GOP is <= 1s"
                 )
+                # Forcing a small GOP helps LG, but some models might still need
+                # a direct signal to the encoder. For now, we rely on the
+                # LG Profile (frequent GOP) which is already active.
             self._send_response(msg, headers=self._session_header())
             return
 
@@ -2114,8 +2126,9 @@ def _wfd_source_ie(rtsp_port: int) -> bytes:
     if rtsp_port <= 0 or rtsp_port > 65535:
         raise WFDNotReady(f"Invalid WFD RTSP port: {rtsp_port}")
     # Build WFD IE with Device Info and Device Name subelements.
-    hostname = socket.gethostname() or "FluxCast"
-    return _wfd_ie_device_info(rtsp_port) + _wfd_ie_device_name(hostname)
+    # I use a static name "FluxCast" to ensure consistency during P2P negotiation.
+    # Some TVs like LG might be sensitive to hostname changes or special characters.
+    return _wfd_ie_device_info(rtsp_port) + _wfd_ie_device_name("FluxCast")
 
 
 def _connection_settings(peer: WFDPeer, rtsp_port: int) -> str:
