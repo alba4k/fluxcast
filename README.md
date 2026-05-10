@@ -1,5 +1,7 @@
 # FluxCast
 
+<img src="https://fluxcast.secweb.cloud/flcast_logo_512x512.png" width="150" display="block">
+
 FluxCast streams a Linux desktop to a TV.
 
 ## Demo
