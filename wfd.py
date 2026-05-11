@@ -43,7 +43,7 @@ def _wfd_ie_device_info(rtsp_port: int) -> bytes:
     """
     return bytes([
         0x00, 0x00, 0x06,
-        0x00, 0x90,  # Info: Source, Coupled Sink support
+        0x00, 0x10,  # Info: WFD Source, Session Available (No HDCP/Coupled Sink)
         (rtsp_port >> 8) & 0xff, rtsp_port & 0xff,
         0x00, 0xc8   # Throughput: 100 Mbps
     ])
@@ -72,6 +72,38 @@ class WFDPeer:
     details: str = ""
     path: str = ""
     source: str = ""
+    rtsp_port: int = 7236
+
+
+def _parse_gdbus_byte_array(raw: str) -> list[int]:
+    """Parse a gdbus @ay variant string into a list of integer byte values.
+
+    NetworkManager returns WFD IEs via gdbus as a formatted string such as:
+    ``<@ay [byte 0x00, byte 0x10, byte 0x1c, byte 0x00, byte 0x1c, ...]>`
+    """
+    return [int(h, 16) for h in re.findall(r"0x([0-9a-fA-F]+)", raw)]
+
+
+def _parse_wfd_ies_rtsp_port(wfd_ies: list[int]) -> int:
+    """
+    Parse the WFD Information Element bytes to find the Sink's RTSP port.
+    WFD Subelement ID 0: WFD Device Information (length 6)
+    Bytes 3-4 of the subelement (offset 3 and 4 after ID and Length) 
+    contain the RTSP port.
+    """
+    if not wfd_ies or len(wfd_ies) < 6:
+        return 7236
+    
+    i = 0
+    while i + 3 <= len(wfd_ies):
+        sub_id = wfd_ies[i]
+        sub_len = (wfd_ies[i+1] << 8) | wfd_ies[i+2]
+        if sub_id == 0 and sub_len >= 6 and i + 3 + sub_len <= len(wfd_ies):
+            # Port is at index i + 3 + 2 and i + 3 + 3
+            port = (wfd_ies[i+5] << 8) | wfd_ies[i+6]
+            return port if port > 0 else 7236
+        i += 3 + sub_len
+    return 7236
 
 
 class WFDNotReady(RuntimeError):
@@ -1414,6 +1446,9 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         self.setup_ms: Optional[float] = None
         self.first_tx_reported = False
 
+        if hasattr(self.server, "parent_server"):
+            self.server.parent_server.has_connected_client = True  # type: ignore[attr-defined]
+
         print(f"[FluxCast WFD RTSP] TV connected from {peer}; local={self.local_ip}")
         _append_latency_log(
             self.media_config.latency_log_path,
@@ -1876,10 +1911,12 @@ class WFDRTSPServer:
         self.media_config = media_config
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self.has_connected_client = False
 
     def start(self) -> None:
         self._server = _ThreadingTCPServer((self.host, self.port), _WFDRTSPHandler)
         self._server.media_config = self.media_config  # type: ignore[attr-defined]
+        self._server.parent_server = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         print(f"[FluxCast WFD RTSP] Server listening on {self.host}:{self.port}")
@@ -2130,12 +2167,19 @@ def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
         address = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "HwAddress")
         model = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Model")
         manufacturer = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Manufacturer")
-        wfd_ies = _nm_get_property(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "WfdIEs")
+        wfd_ies_raw = _nm_get_property(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "WfdIEs")
+        
+        # wfd_ies_raw is the raw gdbus stdout string (e.g. "<@ay [byte 0x00, ...]>").
+        # Parse it into a byte list, then extract the RTSP port from subelement 0.
+        wfd_ies_list = _parse_gdbus_byte_array(wfd_ies_raw)
+        sink_rtsp_port = _parse_wfd_ies_rtsp_port(wfd_ies_list)
+
         details = "; ".join(
             part for part in [
                 f"model={model}" if model else "",
                 f"manufacturer={manufacturer}" if manufacturer else "",
-                f"wfd_ies={wfd_ies}" if wfd_ies else "",
+                f"wfd_ies={wfd_ies_raw}" if wfd_ies_raw else "",
+                f"sink_rtsp_port={sink_rtsp_port}",
             ]
             if part
         )
@@ -2145,6 +2189,7 @@ def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
             details=details,
             path=peer_path,
             source="NetworkManager",
+            rtsp_port=sink_rtsp_port,
         ))
     return peers
 
@@ -2382,6 +2427,254 @@ def print_scan(peers: list[WFDPeer]) -> None:
             print("      WFD capability data detected")
 
 
+def _get_peer_ip_from_arp(peer_mac: str) -> Optional[str]:
+    """Return the IP for peer_mac from the kernel ARP/neighbour table."""
+    if not shutil.which("ip"):
+        return None
+    try:
+        result = _run(["ip", "neigh", "show"], timeout=3.0)
+        if result.returncode != 0:
+            return None
+        mac = peer_mac.lower().replace("-", ":")
+        for line in result.stdout.splitlines():
+            if mac in line.lower():
+                parts = line.split()
+                if parts and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", parts[0]):
+                    return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def _wait_for_peer_ip(peer_mac: str, timeout: float = 12.0) -> Optional[str]:
+    """Poll ARP until the peer's IP appears (DHCP may take a few seconds)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ip = _get_peer_ip_from_arp(peer_mac)
+        if ip:
+            return ip
+        time.sleep(0.75)
+    return None
+
+
+def _active_rtsp_probe(
+    rtsp_server: WFDRTSPServer,
+    peer: WFDPeer,
+    media_config: WFDMediaConfig,
+) -> None:
+    # 7 s: P2P group up + DHCP (~3 s) + TV RTSP-initiation attempt (~3-4 s).
+    time.sleep(7.0)
+    if rtsp_server.has_connected_client:
+        return
+
+    print("[FluxCast WFD RTSP] No passive connection; trying Source-initiated RTSP probe...")
+
+    tv_ip = _wait_for_peer_ip(peer.address, timeout=10.0)
+    if not tv_ip:
+        print(
+            f"[FluxCast WFD RTSP] Active probe: TV IP not found for MAC {peer.address} "
+            "— ARP table empty; is the P2P link still up?"
+        )
+        return
+
+    tv_port = peer.rtsp_port if 0 < peer.rtsp_port <= 65535 else 7236
+    print(f"[FluxCast WFD RTSP] Active probe: TV={tv_ip}; connecting to RTSP port {tv_port}...")
+
+    try:
+        sock = socket.create_connection((tv_ip, tv_port), timeout=5.0)
+    except ConnectionRefusedError:
+        print(
+            f"[FluxCast WFD RTSP] Active probe: TV port {tv_port} refused "
+            "— Sink-only device; waiting for its passive connection to us."
+        )
+        return
+    except OSError as exc:
+        print(f"[FluxCast WFD RTSP] Active probe: connect error: {exc}")
+        return
+
+    print(f"[FluxCast WFD RTSP] Active probe: connected to TV RTSP at {tv_ip}:{tv_port}")
+    sock.settimeout(8.0)
+    rfile = sock.makefile("rb")
+    wfile = sock.makefile("wb")
+    local_ip: str = sock.getsockname()[0]
+    local_uri = f"rtsp://{local_ip}:{rtsp_server.port}/wfd1.0"
+    session_id = str(random.randint(1_000_000, 9_999_999))
+
+    # Mutable session state shared by the nested helpers below.
+    st: dict = {
+        "cseq": 1,
+        "pending": {},
+        "sink_rtp_port": 0,
+        "sink_rtcp_port": 0,
+        "src_port": media_config.source_port,
+        "sink_vfmt": None,
+        "no_audio": media_config.no_audio,
+    }
+
+    def _send(name: str, method: str, uri: str, hdrs: Optional[dict] = None, body: str = "") -> None:
+        cseq = str(st["cseq"])
+        st["cseq"] += 1
+        st["pending"][cseq] = name
+        lines = [f"{method} {uri} RTSP/1.0", f"CSeq: {cseq}"]
+        for k, v in (hdrs or {}).items():
+            lines.append(f"{k}: {v}")
+        if body:
+            lines += ["Content-Type: text/parameters", f"Content-Length: {len(body.encode())}"]
+        lines += ["", body]
+        wfile.write("\r\n".join(lines).encode())
+        wfile.flush()
+        print(f"[FluxCast WFD RTSP] Active probe -> {name}")
+
+    def _reply(msg: RTSPMessage, status: str = "200 OK", extra: Optional[dict] = None, body: str = "") -> None:
+        lines = [f"RTSP/1.0 {status}", f"CSeq: {msg.cseq}", f"Session: {session_id};timeout=30"]
+        for k, v in (extra or {}).items():
+            lines.append(f"{k}: {v}")
+        lines += [f"Content-Length: {len(body.encode())}", "", body]
+        wfile.write("\r\n".join(lines).encode())
+        wfile.flush()
+
+    media: Optional[WFDMediaPipeline] = None
+    try:
+        with sock:
+            _send("M1_OPTIONS", "OPTIONS", "*", {"Require": "org.wfa.wfd1.0"})
+            while True:
+                msg = _read_rtsp_message(rfile)
+                if msg is None:
+                    print("[FluxCast WFD RTSP] Active probe: TV closed connection.")
+                    break
+
+                if msg.is_response:
+                    name = st["pending"].pop(msg.cseq, "UNKNOWN")
+                    if not msg.status.startswith("200"):
+                        print(f"[FluxCast WFD RTSP] Active probe: {name} failed: {msg.status}")
+                        break
+                    print(f"[FluxCast WFD RTSP] Active probe <- OK for {name}")
+
+                    if name == "M1_OPTIONS":
+                        _send("M3_GET_PARAMETER", "GET_PARAMETER", local_uri,
+                              body="wfd_video_formats\r\nwfd_audio_codecs\r\nwfd_client_rtp_ports\r\n")
+
+                    elif name == "M3_GET_PARAMETER":
+                        params = _parse_parameters(msg.body)
+                        ports = _parse_rtp_ports(params.get("wfd_client_rtp_ports", ""))
+                        if not ports or ports[0] <= 0:
+                            print("[FluxCast WFD RTSP] Active probe: no valid RTP ports in M3.")
+                            break
+                        st["sink_rtp_port"], st["sink_rtcp_port"] = ports
+                        st["sink_vfmt"] = _parse_sink_video_format(params.get("wfd_video_formats", ""))
+                        audio = params.get("wfd_audio_codecs", "")
+                        if audio and not media_config.no_audio and "AAC" not in audio.upper():
+                            st["no_audio"] = True
+                        st["src_port"] = _safe_source_port(
+                            media_config.source_port, st["sink_rtp_port"], st["sink_rtcp_port"])
+                        vfmt = _selected_video_format(media_config, st["sink_vfmt"])
+                        afmt = "none" if st["no_audio"] else WFD_AUDIO_AAC
+                        rtcp = st["sink_rtcp_port"] if st["sink_rtcp_port"] > 0 else 0
+                        m4 = (
+                            f"wfd_video_formats: {vfmt}\r\n"
+                            f"wfd_audio_codecs: {afmt}\r\n"
+                            f"wfd_presentation_URL: {local_uri}/streamid=0 none\r\n"
+                            f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast "
+                            f"{st['sink_rtp_port']} {rtcp} mode=play\r\n"
+                        )
+                        _send("M4_SET_PARAMETER", "SET_PARAMETER", local_uri, body=m4)
+
+                    elif name == "M4_SET_PARAMETER":
+                        _send("M5_TRIGGER_SETUP", "SET_PARAMETER", local_uri,
+                              body="wfd_trigger_method: SETUP\r\n")
+
+                    elif name == "M5_TRIGGER_SETUP":
+                        print("[FluxCast WFD RTSP] Active probe: M5 sent — awaiting TV SETUP...")
+                        # TV should now send SETUP on this same TCP connection.
+
+                else:
+                    method = msg.method
+                    print(f"[FluxCast WFD RTSP] Active probe <- TV request: {method}")
+
+                    if method in ("GET_PARAMETER", "SET_PARAMETER"):
+                        _reply(msg)
+
+                    elif method == "OPTIONS":
+                        _reply(msg, extra={
+                            "Public": (
+                                "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, "
+                                "GET_PARAMETER, SET_PARAMETER"
+                            )
+                        })
+
+                    elif method == "SETUP":
+                        ports = _parse_transport_client_ports(msg.headers.get("transport", ""))
+                        if ports:
+                            st["sink_rtp_port"], st["sink_rtcp_port"] = ports
+                        if not st["sink_rtp_port"]:
+                            st["sink_rtp_port"] = 19000
+                        st["src_port"] = _safe_source_port(
+                            media_config.source_port, st["sink_rtp_port"], st["sink_rtcp_port"])
+                        sp = st["src_port"]
+                        sr = st["sink_rtp_port"]
+                        sc = st["sink_rtcp_port"]
+                        transport = (
+                            f"RTP/AVP/UDP;unicast;client_port={sr}-{sc};server_port={sp}-{sp + 1}"
+                            if sc else
+                            f"RTP/AVP/UDP;unicast;client_port={sr};server_port={sp}"
+                        )
+                        _reply(msg, extra={
+                            "Transport": transport,
+                            "Session": f"{session_id};timeout=30",
+                        })
+                        print(f"[FluxCast WFD RTSP] Active probe: SETUP OK; sink RTP={sr}")
+
+                    elif method == "PLAY":
+                        _reply(msg, extra={"Range": "npt=now-"})
+                        mode = _choose_cea_mode(media_config, st["sink_vfmt"])
+                        eff_cfg = replace(
+                            media_config,
+                            source_port=st["src_port"],
+                            output_resolution=mode.resolution,
+                            fps=mode.fps,
+                            no_audio=st["no_audio"],
+                        )
+                        media = WFDMediaPipeline(
+                            eff_cfg,
+                            tv_ip=tv_ip,
+                            local_ip=local_ip,
+                            sink_rtp_port=st["sink_rtp_port"],
+                        )
+                        rtsp_server.has_connected_client = True
+                        print(
+                            f"[FluxCast WFD RTSP] Active probe: PLAY — "
+                            f"starting media ({mode.name})"
+                        )
+                        media.start()
+                        # Keep-alive: respond to GET_PARAMETER/SET_PARAMETER heartbeats.
+                        while True:
+                            ka = _read_rtsp_message(rfile)
+                            if ka is None:
+                                break
+                            if ka.method in ("GET_PARAMETER", "SET_PARAMETER"):
+                                _reply(ka)
+                            elif ka.method == "TEARDOWN":
+                                _reply(ka, extra={"Connection": "close"})
+                                break
+                        return
+
+                    elif method == "TEARDOWN":
+                        _reply(msg, extra={"Connection": "close"})
+                        break
+
+                    else:
+                        _reply(msg, status="405 Method Not Allowed")
+
+    except OSError as exc:
+        print(f"[FluxCast WFD RTSP] Active probe: I/O error: {exc}")
+    finally:
+        if media is not None:
+            media.stop()
+    print("[FluxCast WFD RTSP] Active probe: session ended.")
+
+
+
+
 def start_experimental_backend(args) -> None:
     report = run_diagnostics()
     print_report(report)
@@ -2467,6 +2760,16 @@ def start_experimental_backend(args) -> None:
         )
         connected = True
         _wait_for_nm_activation(active_path)
+
+        # Active probe for newer TVs (Samsung 2024++, some LGs)
+        # It runs in a background thread to not block the main loop.
+        probe_thread = threading.Thread(
+            target=_active_rtsp_probe,
+            args=(rtsp, peer, media_config),
+            daemon=True,
+        )
+        probe_thread.start()
+
         print("[FluxCast WFD] Waiting for TV RTSP/WFD session. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
