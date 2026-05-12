@@ -1046,21 +1046,32 @@ class WFDMediaPipeline:
                 "sliced-threads=true",
             ]
 
+            # Check x264enc properties once; same gst-plugins-ugly version
+            # either has all VBV params or none of them.
+            x264_props = _gst_x264enc_properties()
+
             if is_lg:
                 # LG Profile
                 # gracefully SKIP it if the installed x264enc doesn't support it.
-                x264_props = _gst_x264enc_properties()
-                lg_vbv: list[str] = ["vbv-buf-capacity=100", "rc-lookahead=0"]
+                lg_vbv: list[str] = ["rc-lookahead=0"]
                 if "vbv-maxrate" in x264_props:
                     lg_vbv.insert(0, f"vbv-maxrate={bitrate_kbits}")
                 else:
                     print(
-                        "[FluxCast WFD Media] LG profile: x264enc on this system "
-                        "does not support vbv-maxrate; using vbv-buf-capacity only."
+                        "[FluxCast WFD Media] LG profile: x264enc does not support "
+                        "vbv-maxrate; skipping hard rate cap."
+                    )
+                if "vbv-buf-capacity" in x264_props:
+                    lg_vbv.append("vbv-buf-capacity=100")
+                else:
+                    print(
+                        "[FluxCast WFD Media] LG profile: x264enc does not support "
+                        "vbv-buf-capacity; VBV buffer control unavailable."
                     )
                 encoder_args += lg_vbv
             else:
-                encoder_args += ["vbv-buf-capacity=200"]
+                if "vbv-buf-capacity" in x264_props:
+                    encoder_args += ["vbv-buf-capacity=200"]
 
             return [
                 "pipewiresrc",
