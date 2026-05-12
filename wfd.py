@@ -301,6 +301,44 @@ def _gst_pipewiresrc_properties() -> set[str]:
     return props
 
 
+# Cached at first call; x264enc version varies across distros.
+_gst_x264enc_props_cache: Optional[set[str]] = None
+
+
+def _gst_x264enc_properties() -> set[str]:
+    """Return the set of property names supported by the installed x264enc.
+    Cached after the first call.
+    """
+    global _gst_x264enc_props_cache
+    if _gst_x264enc_props_cache is not None:
+        return _gst_x264enc_props_cache
+    if not shutil.which("gst-inspect-1.0"):
+        _gst_x264enc_props_cache = set()
+        return _gst_x264enc_props_cache
+    try:
+        result = subprocess.run(
+            ["gst-inspect-1.0", "x264enc"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _gst_x264enc_props_cache = set()
+        return _gst_x264enc_props_cache
+    if result.returncode != 0:
+        _gst_x264enc_props_cache = set()
+        return _gst_x264enc_props_cache
+
+    props: set[str] = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s{2}([a-z0-9_-]+)\s+:", line)
+        if match:
+            props.add(match.group(1))
+    _gst_x264enc_props_cache = props
+    return props
+
+
+
 def _pipewiresrc_selector_attempts(
     node_id: int,
     stream_label: str = "",
@@ -1009,12 +1047,18 @@ class WFDMediaPipeline:
             ]
 
             if is_lg:
-                # LG Profile: Hard VBV ceiling to prevent connection resets on spikes.
-                encoder_args += [
-                    f"vbv-maxrate={bitrate_kbits}",
-                    "vbv-buf-capacity=100",
-                    "rc-lookahead=0",
-                ]
+                # LG Profile
+                # gracefully SKIP it if the installed x264enc doesn't support it.
+                x264_props = _gst_x264enc_properties()
+                lg_vbv: list[str] = ["vbv-buf-capacity=100", "rc-lookahead=0"]
+                if "vbv-maxrate" in x264_props:
+                    lg_vbv.insert(0, f"vbv-maxrate={bitrate_kbits}")
+                else:
+                    print(
+                        "[FluxCast WFD Media] LG profile: x264enc on this system "
+                        "does not support vbv-maxrate; using vbv-buf-capacity only."
+                    )
+                encoder_args += lg_vbv
             else:
                 encoder_args += ["vbv-buf-capacity=200"]
 
@@ -1131,9 +1175,6 @@ class WFDMediaPipeline:
                     )
                     continue
 
-                # Some combinations keep gst process alive but produce almost no RTP
-                # payload (black/frozen sink output). Verify real egress before
-                # accepting this attempt.
                 time.sleep(probe_alive_seconds)
                 if gst_proc.poll() is not None:
                     print(
