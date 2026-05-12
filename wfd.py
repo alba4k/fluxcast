@@ -58,13 +58,6 @@ def _wfd_ie_device_name(name: str) -> bytes:
     return bytes([0x0a, (length >> 8) & 0xff, length & 0xff]) + encoded
 
 
-def _wfd_ie_for_rtsp_port(port: int) -> str:
-    # Use a static name "FluxCast" to ensure consistency during P2P negotiation.
-    # Some TVs like LG might be sensitive to hostname changes or special characters.
-    ie_bytes = _wfd_ie_device_info(port) + _wfd_ie_device_name("FluxCast")
-    return ie_bytes.hex()
-
-
 @dataclass
 class WFDPeer:
     address: str
