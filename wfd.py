@@ -1053,7 +1053,14 @@ class WFDMediaPipeline:
             if is_lg:
                 # LG Profile
                 # gracefully SKIP it if the installed x264enc doesn't support it.
-                lg_vbv: list[str] = ["rc-lookahead=0"]
+                lg_vbv: list[str] = []
+                if "rc-lookahead" in x264_props:
+                    lg_vbv.append("rc-lookahead=0")
+                else:
+                    print(
+                        "[FluxCast WFD Media] LG profile: x264enc does not support "
+                        "rc-lookahead; skipping lookahead optimization."
+                    )
                 if "vbv-maxrate" in x264_props:
                     lg_vbv.insert(0, f"vbv-maxrate={bitrate_kbits}")
                 else:
