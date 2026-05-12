@@ -1486,6 +1486,8 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         self.next_cseq = 1
         self.pending: dict[str, str] = {}
         self.session_id = str(random.randint(1_000_000, 9_999_999))
+        self._write_lock = threading.Lock()
+        self._keepalive_active = True
         self.sink_rtp_port: Optional[int] = None
         self.sink_rtcp_port: int = 0
         self.source_rtp_port = self.media_config.source_port
@@ -1525,6 +1527,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         except OSError as exc:
             print(f"[FluxCast WFD RTSP] Socket closed: {exc}")
         finally:
+            self._keepalive_active = False
             self._stop_media()
 
     @property
@@ -1553,8 +1556,9 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         return WFD_AUDIO_AAC
 
     def _send_bytes(self, text: str) -> None:
-        self.wfile.write(text.encode("utf-8"))
-        self.wfile.flush()
+        with self._write_lock:
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
 
     def _send_request(
         self,
@@ -1670,6 +1674,15 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
     def _handle_response(self, msg: RTSPMessage) -> None:
         name = self.pending.pop(msg.cseq, "UNKNOWN")
         if not msg.status.startswith("200"):
+            if name == "M16_KEEPALIVE":
+                # LG (or any TV) rejected our keepalive, STOP RESCHEDULING
+                # but keep the stream alive
+                print(
+                    f"[FluxCast WFD RTSP] M16 keepalive rejected: {msg.status} "
+                    "— disabling keepalive, stream continues."
+                )
+                self._keepalive_active = False
+                return
             raise WFDNotReady(f"RTSP {name} failed: {msg.start}")
 
         print(f"[FluxCast WFD RTSP] <- response for {name}: {msg.status}")
@@ -1797,6 +1810,12 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                     "Range": "npt=now-",
                 },
             )
+            # Schedule RTSP M16 keepalive NOW, before _start_media() blocks
+            # on the portal dialog (8-13 s). LG WebOS resets the TCP connection
+            # ~40-45 s after PLAY. Starting the 20 seconds timer here gives a safe
+            # 20 second head start regardless of portal dialog speed.
+            if "LG" in self.media_config.peer_name.upper():
+                self._schedule_rtsp_keepalive(20.0)
             self._start_media()
             return
 
@@ -1866,6 +1885,33 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
         probe = threading.Timer(delay, self._probe_tx)
         probe.daemon = True
         probe.start()
+
+    def _schedule_rtsp_keepalive(self, delay: float = 25.0) -> None:
+        """Schedule the next RTSP M16 GET_PARAMETER keepalive."""
+        t = threading.Timer(delay, self._send_rtsp_keepalive)
+        t.daemon = True
+        t.start()
+
+    def _send_rtsp_keepalive(self) -> None:
+        """Send RTSP GET_PARAMETER (M16) on the existing TCP connection."""
+        if not self._keepalive_active:
+            return
+        media = self.media
+        # Only stop the chain if processes have already EXITED.
+        # If media is None (portal dialog still open), keep sending keepalives.
+        if media is not None and not all(p.poll() is None for p in media.processes):
+            return
+        try:
+            self._send_request(
+                "M16_KEEPALIVE",
+                "GET_PARAMETER",
+                self._rtsp_presentation_uri(),
+                headers={"Session": f"{self.session_id};timeout=30"},
+            )
+            print("[FluxCast WFD RTSP] M16 keepalive sent")
+            self._schedule_rtsp_keepalive(25.0)
+        except OSError:
+            pass  # Socket dead -> DONT RESCHEDULE
 
     def _probe_tx(self) -> None:
         media = self.media
