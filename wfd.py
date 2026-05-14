@@ -1814,8 +1814,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             # on the portal dialog (8-13 s). LG WebOS resets the TCP connection
             # ~40-45 s after PLAY. Starting the 20 seconds timer here gives a safe
             # 20 second head start regardless of portal dialog speed.
-            if "LG" in self.media_config.peer_name.upper():
-                self._schedule_rtsp_keepalive(20.0)
+            self._schedule_rtsp_keepalive(20.0)
             self._start_media()
             return
 
