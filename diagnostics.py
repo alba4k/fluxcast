@@ -135,6 +135,55 @@ def _ffmpeg_encoders() -> Check:
     )
 
 
+_PORTAL_BACKENDS = [
+    "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-gnome",
+    "xdg-desktop-portal-wlr",
+    "xdg-desktop-portal-lxqt",
+]
+
+
+def _portal_process_check() -> Check:
+    """Check whether xdg-desktop-portal and a backend are actually running."""
+
+    def _pgrep(name: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", name],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    running_backend = next((b for b in _PORTAL_BACKENDS if _pgrep(b)), None)
+    if running_backend:
+        return Check(
+            "xdg-desktop-portal",
+            STATUS_OK,
+            "Wayland portal stack is running",
+            running_backend,
+        )
+
+    if _pgrep("xdg-desktop-portal"):
+        return Check(
+            "xdg-desktop-portal",
+            STATUS_WARN,
+            "portal daemon running but no backend process detected",
+            "is a portal backend installed and enabled?",
+        )
+
+    return Check(
+        "xdg-desktop-portal",
+        STATUS_WARN,
+        "portal daemon not running",
+        "not needed for wf-recorder (Hyprland/Sway); required for GNOME/KDE capture",
+    )
+
+
 def _display_capture_check() -> Check:
     wayland = os.environ.get("WAYLAND_DISPLAY")
     x11 = os.environ.get("DISPLAY")
@@ -156,6 +205,10 @@ def _display_capture_check() -> Check:
         "xdg-desktop-portal-wlr",
         extra_paths=["/usr/libexec/xdg-desktop-portal-wlr", "/usr/lib/xdg-desktop-portal-wlr"],
     )
+    portal_hyprland = _find_binary(
+        "xdg-desktop-portal-hyprland",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-hyprland", "/usr/lib/xdg-desktop-portal-hyprland"],
+    )
 
     if wayland and wf_recorder:
         return Check(
@@ -164,8 +217,8 @@ def _display_capture_check() -> Check:
             "Wayland capture path is available",
             f"WAYLAND_DISPLAY={wayland}; wf-recorder={wf_recorder}",
         )
-    if wayland and portal and (portal_kde or portal_gnome or portal_wlr):
-        backend = portal_kde or portal_gnome or portal_wlr
+    if wayland and portal and (portal_kde or portal_gnome or portal_wlr or portal_hyprland):
+        backend = portal_kde or portal_gnome or portal_wlr or portal_hyprland
         return Check(
             "screen capture",
             STATUS_OK,
@@ -323,35 +376,11 @@ def _python_check() -> Check:
 
 
 def run_diagnostics() -> DiagnosticReport:
-    portal_bin_paths = ["/usr/libexec/xdg-desktop-portal", "/usr/lib/xdg-desktop-portal"]
-    portal_kde_bin_paths = ["/usr/libexec/xdg-desktop-portal-kde", "/usr/lib/xdg-desktop-portal-kde"]
-    portal_gnome_bin_paths = ["/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome"]
-    portal_wlr_bin_paths = ["/usr/libexec/xdg-desktop-portal-wlr", "/usr/lib/xdg-desktop-portal-wlr"]
-
     checks = [
         _python_check(),
         _command_check("ffmpeg", "video/audio transcoding", required=True),
         _command_check("wf-recorder", "Wayland/wlroots screen capture"),
-        _command_check(
-            "xdg-desktop-portal",
-            "Wayland portal service for KDE/GNOME capture",
-            extra_paths=portal_bin_paths,
-        ),
-        _command_check(
-            "xdg-desktop-portal-kde",
-            "KDE Wayland portal backend",
-            extra_paths=portal_kde_bin_paths,
-        ),
-        _command_check(
-            "xdg-desktop-portal-gnome",
-            "GNOME Wayland portal backend",
-            extra_paths=portal_gnome_bin_paths,
-        ),
-        _command_check(
-            "xdg-desktop-portal-wlr",
-            "wlroots Wayland portal backend",
-            extra_paths=portal_wlr_bin_paths,
-        ),
+        _portal_process_check(),
         _command_check("pactl", "PulseAudio/PipeWire-Pulse audio monitor detection"),
         _command_check("xrandr", "X11 monitor detection fallback"),
         _command_check("nmcli", "NetworkManager Wi-Fi Direct control"),
