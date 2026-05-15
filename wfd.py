@@ -730,13 +730,11 @@ class WFDMediaPipeline:
         for proc in self.processes:
             if proc.poll() is None:
                 proc.terminate()
-
-        for proc in self.processes:
-            if proc.poll() is None:
-                try:
-                    proc.wait(timeout=4)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
         self.processes.clear()
         close_portal_capture(self.portal_session)
         self.portal_session = None
@@ -1869,6 +1867,8 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 local_ip=self.local_ip,
                 sink_rtp_port=self.sink_rtp_port,
             )
+            if hasattr(self.server, "parent_server"):
+                self.server.parent_server._register_media(self.media)  # type: ignore[attr-defined]
             self.media.start()
             print("[FluxCast WFD RTSP] PLAY accepted; media stream started.")
             self.play_accepted_at = time.monotonic()
@@ -1975,6 +1975,8 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
     def _stop_media(self) -> None:
         if self.media is not None:
             print("[FluxCast WFD Media] Stopping RTP stream...")
+            if hasattr(self.server, "parent_server"):
+                self.server.parent_server._unregister_media(self.media)  # type: ignore[attr-defined]
             self.media.stop()
             self.media = None
 
@@ -2009,6 +2011,25 @@ class WFDRTSPServer:
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.has_connected_client = False
+        self._media_lock = threading.Lock()
+        self._active_media: list[WFDMediaPipeline] = []
+
+    def _register_media(self, media: WFDMediaPipeline) -> None:
+        with self._media_lock:
+            self._active_media.append(media)
+
+    def _unregister_media(self, media: WFDMediaPipeline) -> None:
+        with self._media_lock:
+            try:
+                self._active_media.remove(media)
+            except ValueError:
+                pass
+
+    def stop_all_media(self) -> None:
+        with self._media_lock:
+            pipelines = list(self._active_media)
+        for pipeline in pipelines:
+            pipeline.stop()
 
     def start(self) -> None:
         self._server = _ThreadingTCPServer((self.host, self.port), _WFDRTSPHandler)
@@ -2371,7 +2392,7 @@ def _disconnect_device(device_path: str) -> None:
     text = (result.stdout + result.stderr).strip()
     if result.returncode == 0:
         print("[FluxCast WFD] NetworkManager P2P device disconnected.")
-    elif text:
+    elif text and "Device.NotActive" not in text:
         print(f"[FluxCast WFD] NetworkManager disconnect warning: {text}")
 
 
@@ -2873,6 +2894,7 @@ def start_experimental_backend(args) -> None:
     except KeyboardInterrupt:
         print("\n[FluxCast WFD] Stopping WFD session...")
     finally:
+        rtsp.stop_all_media()
         rtsp.stop()
         if connected:
             _deactivate_connection(active_path)
