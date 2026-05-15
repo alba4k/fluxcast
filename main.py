@@ -238,8 +238,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    protocol_label = "Chromecast" if args.protocol == "cast" else "UPnP/DLNA"
     print("=" * 55)
-    print("  FluxCast — Desktop → Smart TV via UPnP/DLNA")
+    print(f"  FluxCast - Desktop → Smart TV via {protocol_label}")
     print("=" * 55)
 
     monitor = prompt_monitor()
