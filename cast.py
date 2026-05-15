@@ -43,7 +43,7 @@ def prompt_device(devices: list):
     if not devices:
         print("[FluxCast] ERROR: No Cast devices found on the network.")
         print("[FluxCast] TIP: Use --tv-ip <IP> to connect directly, e.g.:")
-        print("[FluxCast]      python main.py --tv-ip 192.168.100.XXX")
+        print("[FluxCast]      python main.py --protocol cast --tv-ip 192.168.100.XXX")
         sys.exit(1)
 
     print("\n[FluxCast] Found Cast device(s):")
