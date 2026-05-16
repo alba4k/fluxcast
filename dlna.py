@@ -53,19 +53,19 @@ def prompt_device(devices: list):
         model = dev.model_name
         print(f"  [{i}] {name}  ({model})")
 
-    # Auto-select the first Samsung
+    default_idx = 0
     for i, dev in enumerate(devices):
         if "samsung" in dev.model_name.lower() or "samsung" in dev.friendly_name.lower():
-            print(f"[FluxCast] Auto-selected: {dev.friendly_name}")
-            return devices[i]
+            default_idx = i
+            break
 
-    raw = input("Select device [0]: ").strip()
+    raw = input(f"Select device [{default_idx}]: ").strip()
     try:
-        idx = int(raw) if raw else 0
+        idx = int(raw) if raw else default_idx
         return devices[idx]
     except (ValueError, IndexError):
-        print("[FluxCast] Invalid choice, using device 0.")
-        return devices[0]
+        print(f"[FluxCast] Invalid choice, using device {default_idx}.")
+        return devices[default_idx]
 
 
 def _build_didl_metadata(stream_url: str) -> str:

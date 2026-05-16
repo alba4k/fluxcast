@@ -53,19 +53,19 @@ def prompt_device(devices: list):
         host = cc.cast_info.host
         print(f"  [{i}] {name}  ({model})  —  {host}")
 
-    # Auto-select the first Samsung device
+    default_idx = 0
     for i, cc in enumerate(devices):
         if "samsung" in cc.cast_info.model_name.lower():
-            print(f"[FluxCast] Auto-selected: {cc.cast_info.friendly_name}")
-            return devices[i]
+            default_idx = i
+            break
 
-    raw = input("Select device [0]: ").strip()
+    raw = input(f"Select device [{default_idx}]: ").strip()
     try:
-        idx = int(raw) if raw else 0
+        idx = int(raw) if raw else default_idx
         return devices[idx]
     except (ValueError, IndexError):
-        print("[FluxCast] Invalid choice, using device 0.")
-        return devices[0]
+        print(f"[FluxCast] Invalid choice, using device {default_idx}.")
+        return devices[default_idx]
 
 
 def start_cast(device, stream_url: str) -> None:
