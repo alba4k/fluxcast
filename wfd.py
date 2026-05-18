@@ -2816,8 +2816,19 @@ def start_experimental_backend(args) -> None:
                 "in the desktop portal dialog."
             )
         else:
-            from capture import prompt_monitor
-            monitor = prompt_monitor()
+            wfd_monitor_name = getattr(args, "wfd_monitor", None)
+            if wfd_monitor_name:
+                from capture import gather_monitors
+                all_monitors = gather_monitors()
+                monitor = next((m for m in all_monitors if m.name == wfd_monitor_name), None)
+                if monitor is None:
+                    available = ", ".join(m.name for m in all_monitors) or "none"
+                    raise WFDNotReady(
+                        f"Monitor '{wfd_monitor_name}' not found. Available: {available}"
+                    )
+            else:
+                from capture import prompt_monitor
+                monitor = prompt_monitor()
 
     peers = active_scan(interface=args.wfd_interface, timeout=args.wfd_timeout)
     peer = _select_peer(peers, getattr(args, "wfd_peer", None))

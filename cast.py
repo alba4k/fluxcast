@@ -39,12 +39,19 @@ def connect_by_ip(ip: str, port: int = 8009):
     return cast
 
 
-def prompt_device(devices: list):
+def prompt_device(devices: list, device_name: Optional[str] = None):
     if not devices:
         print("[FluxCast] ERROR: No Cast devices found on the network.")
         print("[FluxCast] TIP: Use --tv-ip <IP> to connect directly, e.g.:")
         print("[FluxCast]      python main.py --protocol cast --tv-ip 192.168.100.XXX")
         sys.exit(1)
+
+    if device_name is not None:
+        needle = device_name.lower()
+        for cc in devices:
+            if cc.cast_info.friendly_name.lower() == needle:
+                return cc
+        print(f"[FluxCast] WARNING: Device '{device_name}' not found; falling back to picker.")
 
     print("\n[FluxCast] Found Cast device(s):")
     for i, cc in enumerate(devices):

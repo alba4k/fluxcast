@@ -41,11 +41,18 @@ def discover_devices(timeout: int = 5) -> list:
     return list(unique_renderers.values())
 
 
-def prompt_device(devices: list):
+def prompt_device(devices: list, device_name: Optional[str] = None):
     if not devices:
         print("[FluxCast] ERROR: No DLNA renderers found on the network.")
         print("[FluxCast] Make sure the TV is ON and connected to the same Wi-Fi/LAN.")
         sys.exit(1)
+
+    if device_name is not None:
+        needle = device_name.lower()
+        for dev in devices:
+            if dev.friendly_name.lower() == needle:
+                return dev
+        print(f"[FluxCast] WARNING: Device '{device_name}' not found; falling back to picker.")
 
     print("\n[FluxCast] Found DLNA device(s):")
     for i, dev in enumerate(devices):

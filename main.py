@@ -113,6 +113,14 @@ def parse_args() -> argparse.Namespace:
                         help="Wi-Fi interface to use for --wfd-scan, e.g. wlan0")
     parser.add_argument("--wfd-timeout", type=int, default=8, dest="wfd_timeout",
                         help="Wi-Fi Direct scan timeout in seconds (default: 8)")
+    parser.add_argument("--wfd-monitor", default=None, dest="wfd_monitor",
+                        help="Monitor name for WFD capture, e.g. eDP-1 (skips interactive picker)")
+    parser.add_argument("--device-name", default=None, dest="device_name",
+                        help="Pre-select DLNA/Cast device by friendly name (skips interactive picker)")
+    parser.add_argument("--monitor", default=None, dest="monitor_name",
+                        help="Pre-select monitor by name for DLNA/Cast capture, e.g. eDP-1 (skips picker)")
+    parser.add_argument("--tray", action="store_true",
+                        help="Launch system tray interface (no terminal needed)")
     return parser.parse_args()
 
 
@@ -170,6 +178,11 @@ def _wait_for_hls_segments(required_segments: int = 2, timeout: float = 15.0) ->
 
 def main() -> None:
     args = parse_args()
+
+    if args.tray:
+        from tray import run_tray
+        run_tray()
+        return
 
     if args.doctor or args.doctor_json:
         from diagnostics import print_report, run_diagnostics
@@ -243,7 +256,16 @@ def main() -> None:
     print(f"  FluxCast - Desktop → Smart TV via {protocol_label}")
     print("=" * 55)
 
-    monitor = prompt_monitor()
+    if args.monitor_name:
+        from capture import gather_monitors
+        all_mons = gather_monitors()
+        monitor = next((m for m in all_mons if m.name == args.monitor_name), None)
+        if monitor is None:
+            available = ", ".join(m.name for m in all_mons) or "none"
+            print(f"[FluxCast] ERROR: Monitor '{args.monitor_name}' not found. Available: {available}")
+            shutdown()
+    else:
+        monitor = prompt_monitor()
 
     ffmpeg_procs = start_capture(
         monitor=monitor,
@@ -270,7 +292,7 @@ def main() -> None:
     if args.protocol == "dlna":
         from dlna import discover_devices, prompt_device, start_cast
         devices = discover_devices(timeout=args.discover_timeout)
-        tv = prompt_device(devices)
+        tv = prompt_device(devices, args.device_name)
         start_cast(tv, stream_url)
 
     else:  # cast protocol
@@ -280,7 +302,7 @@ def main() -> None:
         else:
             print("[FluxCast] Searching for Cast devices on the network…")
             devices = discover_devices(timeout=args.discover_timeout)
-            tv = prompt_device(devices)
+            tv = prompt_device(devices, args.device_name)
             print(f"[FluxCast] Found: {tv.cast_info.friendly_name}")
         start_cast(tv, stream_url)
 
