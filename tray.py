@@ -138,7 +138,7 @@ def _launch(cmd: list, target: str) -> None:
     log_fp = open(_LOG_PATH, "ab", buffering=0)
     log_fp.write(f"\n=== {target} :: {' '.join(cmd)} ===\n".encode())
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT)
-    log_fp.close()  # child inherited the fd; parent copy no longer needed
+    log_fp.close()
     with _lock:
         _proc = proc
         _cast_target = target

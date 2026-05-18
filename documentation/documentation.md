@@ -10,6 +10,12 @@ python3 main.py
 
 By default, FluxCast starts in `wfd` mode (Miracast/Wi-Fi Display).
 
+If you prefer not to use a terminal, launch with `--tray` to get a system tray icon — no terminal window needed:
+
+```bash
+python3 main.py --tray
+```
+
 ## Modes
 
 - `wfd`: **Primary recommended path** - low-latency via Wi-Fi Direct + RTSP/RTP. Works excellently on Samsung TVs.
@@ -40,6 +46,9 @@ python3 main.py --protocol cast
 - `--doctor`
 - `--doctor-json`
 - `--tv-ip IP` (for `cast` only)
+- `--device-name NAME` pre-select DLNA/Cast device by friendly name
+- `--monitor NAME` pre-select monitor by name for DLNA/Cast capture
+- `--tray` launch system tray interface (no terminal needed)
 
 ### WFD Flags
 
@@ -57,6 +66,7 @@ python3 main.py --protocol cast
 - `--wfd-rtp-source-port PORT`
 - `--wfd-interface IFACE`
 - `--wfd-timeout SEC`
+- `--wfd-monitor NAME` pre-select monitor by name for WFD capture (skips interactive picker)
 
 ## Flag Details
 
@@ -74,6 +84,13 @@ python3 main.py --protocol cast
   - Formats: `3000k`, `3M`, `5M`.
   - Desktop WFD has a quality floor (the code may automatically raise a too-low bitrate).
 
+### System Tray
+
+- `--tray`
+  - Launches a system tray icon instead of a terminal session. Scan, select device and monitor, start/stop casting. All from the tray menu.
+  - Requires `libappindicator` (Hyprland/KDE) or `gnome-shell-extension-appindicator` (GNOME).
+  - On non-Hyprland Wayland (KDE, GNOME), WFD capture uses the xdg-desktop-portal screen picker dialog.
+
 ### DLNA/Cast
 
 - `--host`, `--port`
@@ -90,6 +107,12 @@ python3 main.py --protocol cast
   - `live-ts`: Experimental live MPEG-TS transport
 - `--tv-ip`
   - For `cast`: direct IP connection without discovery (may not work on Samsung TVs).
+- `--device-name NAME`
+  - Skip the interactive device picker and connect directly to the named DLNA or Chromecast device. Match is by friendly name (exact string as reported by the device).
+  - Example: `--device-name "Samsung TV"`
+- `--monitor NAME`
+  - Skip the interactive monitor picker and capture the named monitor for DLNA/Cast streams. Use the output name as shown by `xrandr` or `wlr-randr` (e.g. `eDP-1`, `HDMI-A-1`).
+  - Example: `--monitor eDP-1`
 
 ### Diagnostics
 
@@ -111,6 +134,9 @@ python3 main.py --protocol cast
   - Explicit interface for scan path.
 - `--wfd-timeout`
   - Active peer discovery timeout.
+- `--wfd-monitor NAME`
+  - Skip the interactive monitor picker for WFD capture. Accepts the output name (e.g. `eDP-1`). Has no effect when WFD capture uses the xdg-desktop-portal (KDE/GNOME Wayland), where the portal dialog handles monitor selection itself.
+  - Example: `--wfd-monitor eDP-1`
 
 ### WFD Media
 
