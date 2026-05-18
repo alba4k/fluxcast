@@ -74,10 +74,13 @@ def _refresh() -> None:
             _refresh_pending = False
         try:
             items = _build_menu()
-            gtk_menu = _icon._create_menu(pystray.Menu(*items))
-            if gtk_menu is not None:
-                _icon._menu_handle = gtk_menu
-                _icon._appindicator.set_menu(gtk_menu)
+            if hasattr(_icon, '_appindicator') and hasattr(_icon, '_create_menu'):
+                gtk_menu = _icon._create_menu(pystray.Menu(*items))
+                if gtk_menu is not None:
+                    _icon._menu_handle = gtk_menu
+                    _icon._appindicator.set_menu(gtk_menu)
+                else:
+                    _icon.update_menu()
             else:
                 _icon.update_menu()
         except Exception as e:
@@ -135,6 +138,7 @@ def _launch(cmd: list, target: str) -> None:
     log_fp = open(_LOG_PATH, "ab", buffering=0)
     log_fp.write(f"\n=== {target} :: {' '.join(cmd)} ===\n".encode())
     proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT)
+    log_fp.close()  # child inherited the fd; parent copy no longer needed
     with _lock:
         _proc = proc
         _cast_target = target
@@ -278,7 +282,6 @@ def _act(fn, *args):
 
 
 def _build_menu():
-    global _selected_monitor_idx
     with _lock:
         proc = _proc
         target = _cast_target
@@ -308,7 +311,7 @@ def _build_menu():
                 pystray.MenuItem(
                     f"{m.name}  ({m.width}×{m.height})",
                     _act(_select_monitor, i),
-                    checked=lambda item, i=i: _selected_monitor_idx == i,
+                    checked=lambda item, i=i, sel=sel_mon: sel == i,
                 )
                 for i, m in enumerate(monitors)
             ]
@@ -316,7 +319,7 @@ def _build_menu():
         elif sc_mon:
             items.append(pystray.MenuItem("Monitor: scanning…", None, enabled=False))
 
-        sel = monitors[min(sel_mon, len(monitors) - 1)] if monitors else None
+        sel = monitors[sel_mon] if monitors else None  # sel_mon already clamped above
         wfd_via_portal = _wfd_uses_portal()
 
         if peers:
