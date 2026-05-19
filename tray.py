@@ -10,7 +10,7 @@ from PIL import Image
 import pystray
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
-_ICON_PATH = os.path.join(_BASE, "flcast_logo_512x512.png")
+_ICON_PATH = os.path.join(_BASE, "assets", "flcast_logo_512x512.png")
 _MAIN = os.path.join(_BASE, "main.py")
 _PY = sys.executable
 _LOG_PATH = "/tmp/fluxcast-cast.log"
