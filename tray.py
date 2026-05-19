@@ -46,6 +46,7 @@ _scanning_wfd = False
 _scanning_dlna = False
 _scanning_cast = False
 _scanning_monitors = False
+_about_thread = None
 
 
 def _log(msg: str) -> None:
@@ -272,6 +273,95 @@ def _select_monitor(idx: int) -> None:
     _refresh()
 
 
+# ── about window ─────────────────────────────────────────────────────────────
+
+def _show_about() -> None:
+    global _about_thread
+    if _about_thread is not None and _about_thread.is_alive():
+        return
+
+    def _run():
+        import tkinter as tk
+        from PIL import ImageTk
+
+        BG = "#0a120d"
+        FG = "#e5e7eb"
+        ACCENT = "#30D987"
+        LINK = "#60a5fa"
+        SEP = "#1e3a26"
+        BTN_BG = "#1a2e1f"
+
+        root = tk.Tk()
+        root.title("About FluxCast")
+        root.resizable(False, False)
+        root.configure(bg=BG)
+
+        frame = tk.Frame(root, bg=BG, padx=28, pady=20)
+        frame.pack()
+
+        try:
+            img = Image.open(_ICON_PATH).resize((72, 72), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            tk.Label(frame, image=photo, bg=BG).pack(pady=(0, 8))
+            root._photo = photo
+        except Exception:
+            pass
+
+        tk.Label(frame, text="FluxCast", font=("sans-serif", 16, "bold"),
+                 bg=BG, fg=FG).pack()
+        tk.Label(frame, text="Desktop → Smart TV streaming for Linux",
+                 font=("sans-serif", 10), bg=BG, fg=ACCENT).pack(pady=(2, 14))
+
+        tk.Frame(frame, bg=SEP, height=1).pack(fill="x", pady=(0, 12))
+
+        story = (
+            "I wanted to watch movies by streaming my Linux desktop to a TV — "
+            "nothing worked. gnome-network-displays gave me one frame and then "
+            "froze. miraclecast hasn't been meaningfully updated in years.\n\n"
+            "So I built FluxCast from scratch: Wi-Fi Direct via NetworkManager, "
+            "full RTSP handshake, RTP media stream. ~1 second latency, "
+            "video and audio. It actually works."
+        )
+        tk.Label(frame, text=story, font=("sans-serif", 10), wraplength=360,
+                 justify="left", bg=BG, fg=FG).pack(pady=(0, 14))
+
+        tk.Frame(frame, bg=SEP, height=1).pack(fill="x", pady=(0, 10))
+
+        for text, url in [
+            ("fluxcast.secweb.cloud", "https://fluxcast.secweb.cloud/"),
+            ("github.com/IlyaP358/fluxcast", "https://github.com/IlyaP358/fluxcast"),
+        ]:
+            lbl = tk.Label(frame, text=text, fg=LINK, cursor="hand2",
+                           font=("sans-serif", 10, "underline"), bg=BG)
+            lbl.pack(anchor="w")
+            lbl.bind("<Button-1>", lambda _, u=url: webbrowser.open(u))
+
+        tk.Frame(frame, bg=SEP, height=1).pack(fill="x", pady=(12, 10))
+
+        FG_DIM = "#6b7280"
+        for text, url in [
+            ("illia.pukalov@teleinformatika.eu", "mailto:illia.pukalov@teleinformatika.eu"),
+            ("Join our Discord", "https://discord.gg/Qa2UTZPpPh"),
+            ("View Contributors", "https://fluxcast.secweb.cloud/contributors.html"),
+        ]:
+            lbl = tk.Label(frame, text=text, fg=FG_DIM, cursor="hand2",
+                           font=("sans-serif", 8, "underline"), bg=BG)
+            lbl.pack()
+            lbl.bind("<Button-1>", lambda _, u=url: webbrowser.open(u))
+
+        tk.Label(frame, text="Author: IlyaP358  |  Code licensed under GPL-3.0",
+                 font=("sans-serif", 7), bg=BG, fg=FG_DIM).pack(pady=(8, 0))
+
+        tk.Button(frame, text="Close", command=root.destroy, width=10,
+                  bg=BTN_BG, fg=FG, activebackground="#253d2a",
+                  activeforeground=FG, relief="flat",
+                  cursor="hand2").pack(pady=(12, 0))
+        root.mainloop()
+
+    _about_thread = threading.Thread(target=_run, daemon=True)
+    _about_thread.start()
+
+
 # ── menu ──────────────────────────────────────────────────────────────────────
 
 def _act(fn, *args):
@@ -387,15 +477,7 @@ def _build_menu():
         items.append(pystray.MenuItem("Rescan Devices", lambda *_: _rescan_all()))
 
     items.append(pystray.Menu.SEPARATOR)
-    items.append(pystray.MenuItem(
-        "FluxCast Website",
-        lambda *_: webbrowser.open("https://fluxcast.secweb.cloud/"),
-    ))
-    items.append(pystray.MenuItem(
-        "GitHub",
-        lambda *_: webbrowser.open("https://github.com/IlyaP358/fluxcast"),
-    ))
-    items.append(pystray.Menu.SEPARATOR)
+    items.append(pystray.MenuItem("About FluxCast", lambda *_: _show_about()))
     items.append(pystray.MenuItem("Exit", _on_exit))
 
     return items
