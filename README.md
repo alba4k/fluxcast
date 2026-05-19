@@ -142,7 +142,8 @@ Hardware:
 Software:
 
 - OS: Arch Linux
-- Kernel: 7.0.3-arch1-1
-- WM: Hyprland 0.54.3
+- Kernel: 7.0.8-arch1-1
+- WM: Hyprland 0.55.2
+- DE (for testing): KDE Plasma 6.6.5 | GNOME 50.1
 - Shell: zsh 5.9
 - Terminal: kitty 0.46.2
