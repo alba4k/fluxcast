@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/ce01804c-2f86-4a5d-8ecf-d6f2a72f55d1
 
 ## Project Status
 
-FluxCast is currently in **early $\mathbf{\color{red}!!!ALPHA!!!}$ testing**. 
+FluxCast is currently in **early $\mathbf{\color{red}!!!BETA!!!}$ testing**. 
 
 Current validated scope:
 
